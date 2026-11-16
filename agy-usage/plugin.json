@@ -1,0 +1,7 @@
+{
+  "name": "agy-usage",
+  "displayName": "agy-usage",
+  "version": "1.0.0",
+  "description": "Minimal context window usage and percentage monitor reading local conversation databases.",
+  "logo": "logo.svg"
+}

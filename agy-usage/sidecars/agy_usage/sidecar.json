@@ -1,0 +1,10 @@
+{
+  "command": "node",
+  "args": [
+    "server.mjs"
+  ],
+  "description": "Minimal context window usage and percentage monitor reading local conversation databases",
+  "display_name": "agy-usage",
+  "has_web_ui": false,
+  "restart_policy": "always"
+}
