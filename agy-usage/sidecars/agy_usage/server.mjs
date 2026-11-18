@@ -100,11 +100,36 @@ function parseGenRow(idx, data) {
     }
   }
 
+  let lastStepIndex = -1;
+  if (m1.has(20)) {
+    for (const kvBuf of m1.get(20)) {
+      const kv = parsePbMap(kvBuf);
+      const key = kv.has(1) ? kv.get(1)[0].toString('utf8') : '';
+      if (key === 'last_step_index' && kv.has(2)) {
+        const n = Number(kv.get(2)[0].toString('utf8'));
+        if (Number.isFinite(n)) lastStepIndex = n;
+        break;
+      }
+    }
+  }
+
   return {
     turn: idx,
     contextTokens,
     maxContextTokens,
+    lastStepIndex,
   };
+}
+
+function parseCheckpointSummaryTokens(metadata) {
+  if (!metadata) return 0;
+  const sm = parsePbMap(Buffer.from(metadata));
+  if (!sm.has(9)) return 0;
+  const m9Buf = sm.get(9)[0];
+  if (!Buffer.isBuffer(m9Buf)) return 0;
+  const m9 = parsePbMap(m9Buf);
+  const out = m9.has(10) ? m9.get(10)[0] : 0;
+  return typeof out === 'number' && Number.isFinite(out) ? out : 0;
 }
 
 function resolveLatestConvId() {
@@ -147,17 +172,39 @@ function inspectConversation(convId, exact = false) {
   let contextTokens = 0;
   let maxContextTokens = 0;
   try {
-    const rows = db.prepare('SELECT idx, data FROM gen_metadata ORDER BY idx DESC').all();
+    const rows = db.prepare('SELECT idx, data FROM gen_metadata ORDER BY idx ASC').all();
+    let firstTurn = null;
+    let latestTurn = null;
     for (const row of rows) {
       const parsed = parseGenRow(row.idx, row.data);
       if (!parsed) continue;
-      if (contextTokens === 0 && parsed.contextTokens > 0) {
-        contextTokens = parsed.contextTokens;
-      }
-      if (maxContextTokens === 0 && parsed.maxContextTokens > 0) {
+      if (parsed.maxContextTokens > 0) {
         maxContextTokens = parsed.maxContextTokens;
       }
-      if (contextTokens > 0 && maxContextTokens > 0) break;
+      if (parsed.contextTokens > 0) {
+        if (!firstTurn) firstTurn = parsed;
+        latestTurn = parsed;
+      }
+    }
+
+    if (latestTurn) {
+      contextTokens = latestTurn.contextTokens;
+      let latestCp = null;
+      try {
+        latestCp = db
+          .prepare('SELECT idx, status, metadata FROM steps WHERE step_type = 23 ORDER BY idx DESC LIMIT 1')
+          .get();
+      } catch {}
+      if (
+        latestCp &&
+        latestTurn.lastStepIndex >= 0 &&
+        latestTurn.lastStepIndex < latestCp.idx
+      ) {
+        const summaryOutTokens = parseCheckpointSummaryTokens(latestCp.metadata);
+        if (latestCp.status === 3 || summaryOutTokens > 0) {
+          contextTokens = (firstTurn ? firstTurn.contextTokens : 0) + summaryOutTokens;
+        }
+      }
     }
   } finally {
     db.close();

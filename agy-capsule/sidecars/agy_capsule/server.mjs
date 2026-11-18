@@ -150,6 +150,17 @@ function parseGenRow(idx, data) {
   };
 }
 
+function parseCheckpointSummaryTokens(metadata) {
+  if (!metadata) return 0;
+  const sm = parsePbMap(Buffer.from(metadata));
+  if (!sm.has(9)) return 0;
+  const m9Buf = sm.get(9)[0];
+  if (!Buffer.isBuffer(m9Buf)) return 0;
+  const m9 = parsePbMap(m9Buf);
+  const out = m9.has(10) ? m9.get(10)[0] : 0;
+  return typeof out === 'number' && Number.isFinite(out) ? out : 0;
+}
+
 let lastDeckConvId = null; // '' when on New Conversation page, or uuid when on /c/<uuid>
 
 function resolveLatestConvId(preferredId) {
@@ -214,7 +225,7 @@ async function inspectConversation(convId, exact = false) {
   let lastStepEpochMs = 0;
   try {
     rawRows = db.prepare('SELECT idx, data FROM gen_metadata ORDER BY idx ASC').all();
-    cpRows = db.prepare('SELECT idx FROM steps WHERE step_type = 23 ORDER BY idx DESC').all();
+    cpRows = db.prepare('SELECT idx, status, metadata FROM steps WHERE step_type = 23 ORDER BY idx DESC').all();
     const stepRow = db.prepare('SELECT metadata FROM steps ORDER BY idx DESC LIMIT 1').get();
     if (stepRow?.metadata) {
       const sm = parsePbMap(Buffer.from(stepRow.metadata));
@@ -249,6 +260,31 @@ async function inspectConversation(convId, exact = false) {
 
   // Start accumulating from the latest compaction checkpoint so pre-compaction
   // output/thinking tokens do not inflate the active context breakdown.
+  if (cpRows.length > 0 && turns.length > 0) {
+    const latestCp = cpRows[0];
+    const latestTurn = turns[turns.length - 1];
+    if (latestTurn.lastStepIndex >= 0 && latestTurn.lastStepIndex < latestCp.idx) {
+      const summaryOutTokens = parseCheckpointSummaryTokens(latestCp.metadata);
+      if (latestCp.status === 3 || summaryOutTokens > 0) {
+        const turn0Tokens = turns[0]?.contextTokens || 0;
+        const compactedTokens = turn0Tokens + summaryOutTokens;
+        const quotaGroups = await fetchQuotaGroups();
+        return {
+          uiVersion: 20,
+          cachedIn: 0,
+          uncachedIn: compactedTokens,
+          contextTokens: compactedTokens,
+          maxContextTokens,
+          lastStepEpochMs,
+          turn0Tokens,
+          totalOutputTokens: 0,
+          totalThinkingTokens: 0,
+          quotaGroups,
+        };
+      }
+    }
+  }
+
   let epochStart = 0;
   if (turns.length > 0) {
     for (const cp of cpRows) {
