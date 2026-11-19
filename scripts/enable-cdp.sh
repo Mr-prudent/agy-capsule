@@ -32,7 +32,8 @@ create_launcher() {
 PLIST
   cat > "$LAUNCHER/Contents/MacOS/launcher" <<'SH'
 #!/bin/sh
-exec open -a "Antigravity" --args --remote-debugging-port=0
+open -b com.google.antigravity --args --remote-debugging-port=0 2>/dev/null ||
+  open -a "Antigravity" --args --remote-debugging-port=0
 SH
   chmod +x "$LAUNCHER/Contents/MacOS/launcher"
   for icon in icon.icns electron.icns app.icns; do
@@ -58,7 +59,8 @@ relaunch() {
     echo "Antigravity is still running; quit it manually and open the launcher." >&2
     exit 1
   fi
-  open -a "Antigravity" --args --remote-debugging-port=0
+  open -b com.google.antigravity --args --remote-debugging-port=0 2>/dev/null ||
+    open -a "Antigravity" --args --remote-debugging-port=0
   sleep 1
   cat "$HOME/Library/Application Support/Antigravity/DevToolsActivePort" 2>/dev/null | head -1 ||
     echo "DevToolsActivePort not written yet; give it a couple of seconds." >&2

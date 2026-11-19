@@ -51,7 +51,13 @@ done
 if pgrep -x Antigravity >/dev/null 2>&1; then
   exit 0
 fi
-open -a "Antigravity" --args --remote-debugging-port=0
+open -b com.google.antigravity --args --remote-debugging-port=0 2>/dev/null ||
+  open -a "Antigravity" --args --remote-debugging-port=0
+`;
+
+const LAUNCHER_SCRIPT = `#!/bin/sh
+open -b com.google.antigravity --args --remote-debugging-port=0 2>/dev/null ||
+  open -a "Antigravity" --args --remote-debugging-port=0
 `;
 
 function runExec(file, args, options = {}) {
@@ -98,7 +104,7 @@ export function installDarwinLauncher() {
 
     writeFileSync(join(LAUNCHER_DIR, 'Contents', 'Info.plist'), MAC_INFO_PLIST, 'utf8');
     const launcher = join(macosDir, 'launcher');
-    writeFileSync(launcher, '#!/bin/sh\nexec open -a "Antigravity" --args --remote-debugging-port=0\n', 'utf8');
+    writeFileSync(launcher, LAUNCHER_SCRIPT, 'utf8');
     chmodSync(launcher, 0o755);
 
     const icon = join(resourcesDir, 'AppIcon.icns');
