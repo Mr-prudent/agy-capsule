@@ -6,12 +6,22 @@ import { homedir } from 'node:os';
 
 const INTERVAL_MS = 1000;
 const INSTANCE_TS = Date.now();
-const PORT_FILE =
-  process.platform === 'darwin'
-    ? join(homedir(), 'Library', 'Application Support', 'Antigravity', 'DevToolsActivePort')
-    : process.platform === 'win32'
-      ? join(process.env.APPDATA || join(homedir(), 'AppData', 'Roaming'), 'Antigravity', 'DevToolsActivePort')
-      : join(process.env.XDG_CONFIG_HOME || join(homedir(), '.config'), 'Antigravity', 'DevToolsActivePort');
+
+function resolvePortFile() {
+  // AGY_BROWSER_ACTIVE_PORT_FILE is exported by Antigravity only when it was
+  // started with --remote-debugging-port; follow it if present.
+  const fromEnv = process.env.AGY_USAGE_CDP_PORT_FILE || process.env.AGY_BROWSER_ACTIVE_PORT_FILE;
+  if (fromEnv) return fromEnv;
+  if (process.platform === 'darwin') {
+    return join(homedir(), 'Library', 'Application Support', 'Antigravity', 'DevToolsActivePort');
+  }
+  if (process.platform === 'win32') {
+    return join(process.env.APPDATA || join(homedir(), 'AppData', 'Roaming'), 'Antigravity', 'DevToolsActivePort');
+  }
+  return join(process.env.XDG_CONFIG_HOME || join(homedir(), '.config'), 'Antigravity', 'DevToolsActivePort');
+}
+
+const PORT_FILE = resolvePortFile();
 
 const sockets = new Map(); // targetId -> { ws, pending: Map, nextId }
 let lastErr = '';
@@ -269,17 +279,20 @@ function toView(d) {
   };
 }
 
-async function tick(inspect) {
+async function tick(inspect, state) {
   const port = readCdpPort();
-  if (!port) return logOnce('DevToolsActivePort not found');
+  if (!port) return state.set('missing');
   let targets;
   try {
-    targets = await (await fetch(`http://127.0.0.1:${port}/json/list`)).json();
+    const res = await fetch(`http://127.0.0.1:${port}/json/list`, { signal: AbortSignal.timeout(3000) });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    targets = await res.json();
   } catch (e) {
-    return logOnce('CDP list failed: ' + e.message);
+    return state.set('unreachable', 'CDP list failed: ' + e.message);
   }
+  state.set('ok');
   const pages = targets.filter(
-    (t) => t.type === 'page' && /^https?:\/\/127\.0\.0\.1/.test(t.url || '') && t.webSocketDebuggerUrl
+    (t) => t.type === 'page' && /^https?:\/\/127\.0\.0\.1(:\d+)?\//.test(t.url || '') && t.webSocketDebuggerUrl
   );
   for (const t of pages) {
     try {
@@ -301,16 +314,54 @@ async function tick(inspect) {
 
 export { pageMount, toView };
 
-export function startDeckInjector(inspect) {
+export function startDeckInjector(inspect, options = {}) {
   let busy = false;
-  setInterval(async () => {
-    if (busy) return;
+  let stopped = false;
+  // 'unknown' | 'ok' | 'missing' | 'unreachable' — the sidebar-less plugin uses
+  // this to decide whether to offer debugging-port setup.
+  let cdpState = 'unknown';
+
+  const state = {
+    set(next, detail = '') {
+      const changed = next !== cdpState;
+      cdpState = next;
+      if (next === 'missing') logOnce('DevToolsActivePort not found (remote debugging is off)');
+      else if (next === 'unreachable') logOnce(detail || 'CDP unreachable');
+      else if (next === 'ok') lastErr = '';
+      if (changed) {
+        try {
+          options.onState?.(next, detail);
+        } catch (e) {
+          console.error('[agy-usage] onState handler failed:', e?.message || e);
+        }
+      }
+    },
+  };
+
+  const timer = setInterval(async () => {
+    if (busy || stopped) return;
     busy = true;
     try {
-      await tick(inspect);
+      await tick(inspect, state);
+    } catch (e) {
+      state.set('unreachable', e?.message || String(e));
     } finally {
       busy = false;
     }
   }, INTERVAL_MS);
+
   console.log('[agy-usage] injector started, port file:', PORT_FILE);
+  return {
+    status: () => cdpState,
+    stop() {
+      stopped = true;
+      clearInterval(timer);
+      for (const entry of sockets.values()) {
+        try {
+          entry.ws.close();
+        } catch {}
+      }
+      sockets.clear();
+    },
+  };
 }

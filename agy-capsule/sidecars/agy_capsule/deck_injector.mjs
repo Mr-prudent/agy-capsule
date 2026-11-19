@@ -3,6 +3,10 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
+import { createHash } from 'node:crypto';
+import { createPresentation, getPresentationScript } from './ui.mjs';
+
+const { escapeHtml, appearance, cacheView, contextBreakdown, quotaView, makeRingSvg } = createPresentation();
 
 const INTERVAL_MS = 1000;
 const INSTANCE_TS = Date.now();
@@ -13,75 +17,19 @@ const PORT_FILE =
       ? join(process.env.APPDATA || join(homedir(), 'AppData', 'Roaming'), 'Antigravity', 'DevToolsActivePort')
       : join(process.env.XDG_CONFIG_HOME || join(homedir(), '.config'), 'Antigravity', 'DevToolsActivePort');
 
-const sockets = new Map(); // targetId -> { ws, pending: Map, nextId }
-let lastErr = '';
-
-function logOnce(msg) {
-  if (msg !== lastErr) {
-    lastErr = msg;
-    console.error('[deck]', msg);
+// A renderer can retain several composers while only one is on screen.
+function findFooterLeft() {
+  let best = null, bestWidth = 0;
+  for (const el of document.querySelectorAll('.agy-composer-footer > div:first-child')) {
+    if (!el.checkVisibility({ opacityProperty: true, visibilityProperty: true })) continue;
+    const r = el.getBoundingClientRect();
+    if (Math.min(r.bottom, window.innerHeight) <= Math.max(r.top, 0)) continue;
+    const width = Math.min(r.right, window.innerWidth) - Math.max(r.left, 0);
+    if (width > bestWidth) { best = el; bestWidth = width; }
   }
+  return best;
 }
 
-function readCdpPort() {
-  try {
-    return readFileSync(PORT_FILE, 'utf-8').split('\n')[0].trim();
-  } catch {
-    return '';
-  }
-}
-
-async function connect(target) {
-  const ws = new WebSocket(target.webSocketDebuggerUrl);
-  const entry = { ws, pending: new Map(), nextId: 1 };
-  await new Promise((resolve, reject) => {
-    const t = setTimeout(() => reject(new Error('ws timeout')), 3000);
-    ws.onopen = () => {
-      clearTimeout(t);
-      resolve();
-    };
-    ws.onerror = () => {
-      clearTimeout(t);
-      reject(new Error('ws error'));
-    };
-  });
-  ws.onmessage = (e) => {
-    try {
-      const msg = JSON.parse(e.data);
-      const cb = entry.pending.get(msg.id);
-      if (cb) {
-        entry.pending.delete(msg.id);
-        cb(msg);
-      }
-    } catch {}
-  };
-  ws.onclose = () => sockets.delete(target.id);
-  sockets.set(target.id, entry);
-  return entry;
-}
-
-function evaluate(entry, expression) {
-  return new Promise((resolve) => {
-    const id = entry.nextId++;
-    const t = setTimeout(() => {
-      entry.pending.delete(id);
-      resolve(undefined);
-    }, 3000);
-    entry.pending.set(id, (msg) => {
-      clearTimeout(t);
-      resolve(msg?.result?.result?.value);
-    });
-    entry.ws.send(
-      JSON.stringify({
-        id,
-        method: 'Runtime.evaluate',
-        params: { expression, returnByValue: true },
-      })
-    );
-  });
-}
-
-// Self-contained function executed inside the Antigravity renderer page.
 function pageMount(d) {
   if (window.__deckOwnerTs && d.instanceTs && d.instanceTs < window.__deckOwnerTs) {
     return 'superseded';
@@ -89,18 +37,57 @@ function pageMount(d) {
   if (d.instanceTs) {
     window.__deckOwnerTs = d.instanceTs;
   }
-  const footerLeft = document.querySelector('.agy-composer-footer > div:first-child');
-  if (!footerLeft) return 'no-footer';
+  const footerLeft = findFooterLeft();
+  if (!footerLeft) {
+    window.__agyCapsuleCleanup?.();
+    return 'no-footer';
+  }
+  const presentation = globalThis.__agyCapsulePresentation;
 
-  let root = document.getElementById('deck-metrics-strip');
+  const clearFooterLayout = (node) => {
+    node._turboTarget?.removeAttribute('data-deck-turbo-collapsed');
+    const footer = node._observedFooterLeft || node.closest('.agy-composer-footer > div:first-child');
+    if (!footer) return;
+    const classes = ['dk-fl-squeezed', 'dk-model-squeezed', 'dk-model-squeezed-hard', 'dk-squeeze-box', 'dk-squeeze-item'];
+    for (const element of [footer, ...footer.querySelectorAll(classes.map(c => '.' + c).join(','))]) element.classList.remove(...classes);
+  };
+  const release = (node) => {
+    if (!node) return;
+    document.removeEventListener('click', node._onOutsideClick);
+    document.removeEventListener('keydown', node._onEscape);
+    if (node._onResize) window.removeEventListener('resize', node._onResize);
+    node._modelObserver?.disconnect();
+    node._resizeObserver?.disconnect();
+    if (node._layoutRaf) cancelAnimationFrame(node._layoutRaf);
+    node._layoutRaf = 0;
+    clearFooterLayout(node);
+  };
+  // A late legacy injector may recreate its light-DOM strip after migration.
+  // Remove it on every pass, not only when initializing the shadow host.
+  const legacy = document.getElementById('deck-metrics-strip');
+  if (legacy) { release(legacy); legacy.remove(); }
+  let host = document.getElementById('agy-capsule-host');
+  let root = host?.shadowRoot?.getElementById('deck-metrics-strip');
   if (!root) {
+    window.__agyCapsuleCleanup?.();
+    host?.remove();
+    host = document.createElement('div');
+    host.id = 'agy-capsule-host';
+    host.style.display = 'contents';
+    const shadow = host.attachShadow({ mode: 'open' });
     root = document.createElement('div');
     root.id = 'deck-metrics-strip';
+    shadow.appendChild(root);
   }
 
   // Upgrade or initialize DOM structure in-place
-  if (root.getAttribute('data-deck-ver') !== '40') {
-    root.setAttribute('data-deck-ver', '40');
+  if (root.getAttribute('data-deck-ver') !== '110') {
+    release(root);
+    root._pinnedGroup = null;
+    root.removeAttribute('data-pinned');
+    root.setAttribute('data-deck-ver', '110');
+    root._speedActivity = null;
+    root._motionPrev = null;
     root.style.cssText = [
       'display: inline-flex',
       'align-items: center',
@@ -123,13 +110,18 @@ function pageMount(d) {
 
     root.innerHTML = `
       <style>
+        #deck-metrics-strip, #deck-metrics-strip * { box-sizing: border-box; }
         #deck-metrics-strip .dk-grp {
           display: inline-flex;
           align-items: center;
-          /* Both popovers anchor to the shared metrics strip. */
-          position: static;
+          /* Popovers are placed by JS relative to their group: context and
+             quota start at the strip's left edge but always reach their own
+             capsule's right edge; the error panel right-aligns to its capsule. */
+          position: relative;
         }
         #deck-metrics-strip .dk-pill {
+          font: inherit;
+          color: inherit;
           display: inline-flex;
           align-items: center;
           gap: 5px;
@@ -142,17 +134,73 @@ function pageMount(d) {
           white-space: nowrap;
           transition: background 0.12s ease, color 0.12s ease;
         }
-        #deck-metrics-strip .dk-grp:hover .dk-pill {
+        #deck-metrics-strip .dk-grp:hover .dk-pill,
+        #deck-metrics-strip .dk-grp[data-pinned="true"] .dk-pill {
           background: var(--secondary, rgba(128, 128, 128, 0.12));
           color: var(--foreground, #0a0a0c);
         }
         #deck-metrics-strip .dk-grp:hover .dk-val,
-        #deck-metrics-strip .dk-grp:hover .dk-svg {
+        #deck-metrics-strip .dk-grp:hover .dk-svg,
+        #deck-metrics-strip .dk-grp[data-pinned="true"] .dk-val,
+        #deck-metrics-strip .dk-grp[data-pinned="true"] .dk-svg {
           color: var(--foreground, #0a0a0c);
         }
         #deck-metrics-strip .dk-pill-quota {
           gap: 10px;
         }
+        #deck-metrics-strip .dk-q-pair[hidden] { display: none; }
+        #deck-metrics-strip .dk-grp[hidden] { display: none; }
+        #deck-metrics-strip [data-el="grpError"] .dk-pill,
+        #deck-metrics-strip [data-el="grpError"] .dk-val,
+        #deck-metrics-strip [data-el="grpError"] .dk-svg { color: #e06c75; }
+        #deck-metrics-strip [data-el="grpError"][data-alert-mode="queue"] .dk-pill,
+        #deck-metrics-strip [data-el="grpError"][data-alert-mode="queue"] .dk-val,
+        #deck-metrics-strip [data-el="grpError"][data-alert-mode="queue"] .dk-svg { color: light-dark(#d97706, #d4940a); }
+        #deck-metrics-strip [data-el="grpError"] [data-alert-icon] { display: none; }
+        #deck-metrics-strip [data-el="grpError"][data-alert-mode="error"] [data-alert-icon="error"],
+        #deck-metrics-strip [data-el="grpError"][data-alert-mode="queue"] [data-alert-icon="queue"] { display: inline-block; }
+        #deck-metrics-strip .dk-error-pop { width: 240px; }
+        #deck-metrics-strip .dk-error-heading { font-weight: 600; margin-bottom: 8px; color: var(--foreground, #ddd); }
+        #deck-metrics-strip .dk-error-diagnostic { margin-top: 10px; padding-top: 8px; border-top: 1px solid var(--border, #444); white-space: pre-wrap; }
+        #deck-metrics-strip .dk-error-diagnostic:empty { display: none; }
+        #deck-metrics-strip.dk-hide-error-label [data-el="grpError"] .dk-val,
+        #deck-metrics-strip.dk-hide-ctx [data-el="grpCtx"] { display: none; }
+        #deck-metrics-strip[data-context-tone="warning"] [data-k="pillCtx"] { color: #d4940a !important; }
+        #deck-metrics-strip[data-context-tone="error"] [data-k="pillCtx"] { color: #e06c75 !important; }
+        #deck-metrics-strip .dk-speed { padding-left: 2px; font-variant-numeric: tabular-nums; }
+        #deck-metrics-strip .dk-speed-dot { display: none; }
+        #deck-metrics-strip .dk-speed[data-motion] { display: inline-flex; align-items: center; gap: 4px; transition: color .35s ease; }
+        #deck-metrics-strip .dk-speed[data-motion] .dk-speed-dot { display: inline-block; width: 5px; height: 5px; flex-shrink: 0; border-radius: 50%; background: currentColor; }
+        #deck-metrics-strip .dk-speed[data-tier="green"] { color: light-dark(#16a34a, #4ea84e); }
+        #deck-metrics-strip .dk-speed[data-tier="yellow"] { color: light-dark(#d97706, #d4940a); }
+        #deck-metrics-strip .dk-speed[data-tier="red"] { color: light-dark(#dc2626, #e06c75); }
+        #deck-metrics-strip .dk-speed[data-motion="idle"] { color: var(--muted-foreground, #8e8e93); }
+        #deck-metrics-strip .dk-pill:hover .dk-speed[data-motion="idle"],
+        #deck-metrics-strip .dk-grp[data-pinned="true"] .dk-speed[data-motion="idle"] { color: var(--foreground, #ebebeb); }
+        #deck-metrics-strip .dk-speed[data-motion="active"] .dk-speed-dot { animation: dk-speed-breathe 1.2s ease-in-out infinite; }
+        #deck-metrics-strip .dk-speed[data-motion="recent"] .dk-speed-dot { opacity: .9; }
+        #deck-metrics-strip .dk-speed[data-motion="idle"] .dk-speed-dot { opacity: .48; }
+        /* Same motion language as the settings previews: colors ease over .18s. */
+        #deck-metrics-strip [data-k="pillCtx"], #deck-metrics-strip [data-el="ctxIconSvg"],
+        #deck-metrics-strip .dk-cache-pct, #deck-metrics-strip .dk-cache-k { transition: color .18s ease, opacity .18s ease; }
+        @keyframes dk-speed-breathe { 0%,100% { opacity: 1; transform: scale(1); } 50% { opacity: .35; transform: scale(.78); } }
+        @media (prefers-reduced-motion: reduce) {
+          #deck-metrics-strip .dk-speed[data-motion="active"] .dk-speed-dot { animation: none; }
+          #deck-metrics-strip .dk-speed[data-motion] { transition: none; }
+          #deck-metrics-strip [data-k="pillCtx"], #deck-metrics-strip [data-el="ctxIconSvg"],
+          #deck-metrics-strip .dk-cache-pct, #deck-metrics-strip .dk-cache-k, #deck-metrics-strip .dk-cache-meter > span, #deck-metrics-strip .dk-q-group, #deck-metrics-strip .dk-q-active { transition: none; }
+        }
+        #deck-metrics-strip .dk-speed[hidden],
+        #deck-metrics-strip.dk-hide-speed .dk-speed { display: none; }
+        #deck-metrics-strip .dk-generation { margin-top: 10px; padding-top: 9px; border-top: 1px solid var(--border, rgba(142,142,147,.24)); font-variant-numeric: tabular-nums; }
+        #deck-metrics-strip .generation-grid { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: var(--agy-row-gap, 5px) 10px; align-items: baseline; }
+        #deck-metrics-strip .generation-row { display: inline-flex; align-items: baseline; gap: 4px; min-width: 0; font-size: 13.5px; font-weight: 400; color: var(--muted-foreground, #8e8e93); }
+        #deck-metrics-strip [data-generation-row="speed"] { justify-self: end; }
+        #deck-metrics-strip .generation-row > :first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        #deck-metrics-strip .generation-row > :last-child { flex-shrink: 0; white-space: nowrap; font-weight: 500; color: var(--foreground, #18181b); color: color-mix(in srgb, var(--foreground, #18181b) 88%, transparent); }
+        #deck-metrics-strip [data-generation-row="timing"] > :last-child { font-weight: 400; color: var(--muted-foreground, #8e8e93); }
+        #deck-metrics-strip .generation-heading { margin-bottom: 8px; font-size: 13.5px; font-weight: 500; color: var(--foreground, #18181b); color: color-mix(in srgb, var(--foreground, #18181b) 88%, transparent); }
+        #deck-metrics-strip .generation-row[hidden], #deck-metrics-strip [data-generation-group][hidden] { display: none; }
         #deck-metrics-strip.dk-hide-wk [data-el="pairWk"],
         #deck-metrics-strip.dk-hide-5h [data-el="pair5h"] {
           display: none;
@@ -178,31 +226,6 @@ function pageMount(d) {
         }
         #deck-metrics-strip.dk-hide-all {
           display: none !important;
-        }
-        .dk-fl-squeezed {
-          min-width: 0 !important;
-          flex-shrink: 1 !important;
-        }
-        .dk-model-squeezed {
-          min-width: 0 !important;
-          flex: 0 1 auto !important;
-          overflow: hidden !important;
-          max-width: 100% !important;
-        }
-        .dk-model-squeezed .dk-squeeze-box,
-        .dk-model-squeezed .dk-squeeze-item {
-          min-width: 0 !important;
-          max-width: 100% !important;
-          overflow: hidden !important;
-          text-overflow: ellipsis !important;
-          white-space: nowrap !important;
-        }
-        .dk-model-squeezed .dk-squeeze-box,
-        .dk-model-squeezed-hard .dk-squeeze-item {
-          flex-shrink: 1 !important;
-        }
-        .dk-model-squeezed svg {
-          flex-shrink: 0 !important;
         }
         #deck-metrics-strip .dk-q-pair {
           display: inline-flex;
@@ -231,7 +254,9 @@ function pageMount(d) {
           backdrop-filter: blur(22px);
           border: 1px solid var(--border, rgba(128, 128, 128, 0.18));
           border-radius: 10px;
-          padding: 10px 12px;
+          padding: var(--agy-pad-y, 10px) var(--agy-pad-x, 12px);
+          max-width: var(--dk-pop-max-width, calc(100vw - 16px));
+          overflow-wrap: anywhere;
           box-shadow: 0 2px 8px rgba(0, 0, 0, 0.06), 0 1px 2px rgba(0, 0, 0, 0.03);
           z-index: 999999;
           color: var(--muted-foreground, #8e8e93);
@@ -242,35 +267,65 @@ function pageMount(d) {
         #deck-metrics-strip .dk-grp:hover .dk-pop {
           display: block;
         }
+        #deck-metrics-strip .dk-grp[data-pinned="true"] .dk-pop { display: block; pointer-events: auto; }
+        #deck-metrics-strip[data-pinned] .dk-grp:not([data-pinned="true"]):hover .dk-pop { display: none; }
+        #deck-metrics-strip .dk-grp[data-dismissed="true"] .dk-pop { display: none; }
         /* Context Popover (matches plugin UI) */
         #deck-metrics-strip .dk-ctx-pop {
-          width: max-content;
-          min-width: 176px;
+          width: 228px;
         }
         #deck-metrics-strip .dk-cache-bar {
           display: flex;
           justify-content: space-between;
           align-items: center;
-          gap: 12px;
+          gap: 8px;
           font-size: 13.5px;
           line-height: 1.35;
-          margin-top: 2px;
           padding-bottom: 5px;
           margin-bottom: 7.5px;
-          border-bottom: 1px solid rgba(142, 142, 147, 0.24);
-          border-bottom: 1px solid color-mix(in srgb, var(--foreground, #18181b) 17%, transparent);
+          border-bottom: 1px solid var(--border, rgba(142, 142, 147, 0.24));
         }
         #deck-metrics-strip .dk-cache-left {
           display: inline-flex;
           align-items: center;
-          gap: 7px;
+          gap: 5px;
           font-weight: 500;
           color: var(--foreground, #18181b);
           color: color-mix(in srgb, var(--foreground, #18181b) 88%, transparent);
           white-space: nowrap;
         }
+        #deck-metrics-strip .dk-cache-left > .dk-dot {
+          width: 10px;
+          height: 10px;
+          flex-shrink: 0;
+        }
+        #deck-metrics-strip[data-cache-indicator="ring"] .dk-cache-left > .dk-dot {
+          width: 14px;
+          height: 14px;
+        }
+        #deck-metrics-strip .dk-cache-left > .dk-dot:empty {
+          display: none !important;
+        }
+        #deck-metrics-strip .dk-cache-meter {
+          flex: 1;
+          min-width: 32px;
+          height: 4px;
+          border-radius: 999px;
+          background: rgba(142, 142, 147, 0.24);
+          overflow: hidden;
+        }
+        #deck-metrics-strip .dk-cache-meter[hidden] {
+          display: none;
+        }
+        #deck-metrics-strip .dk-cache-meter > span {
+          display: block;
+          height: 100%;
+          width: 0%;
+          border-radius: inherit;
+          transition: width 0.35s linear, background-color 0.25s ease;
+        }
         #deck-metrics-strip .dk-cache-pct {
-          margin-left: -2px;
+          margin-left: 0;
           font-variant-numeric: tabular-nums;
           font-size: 13.5px;
           white-space: nowrap;
@@ -290,20 +345,23 @@ function pageMount(d) {
           display: flex;
           justify-content: space-between;
           align-items: baseline;
-          gap: 12px;
+          gap: 6px;
           margin-bottom: 6.5px;
         }
         #deck-metrics-strip .dk-used-pct {
           font-size: 13.5px;
+          font-weight: 400;
+          color: var(--muted-foreground, #8e8e93);
+        }
+        #deck-metrics-strip .dk-used-pct > [data-k="usedPctText"] {
           font-weight: 500;
           color: var(--foreground, #18181b);
           color: color-mix(in srgb, var(--foreground, #18181b) 88%, transparent);
         }
         #deck-metrics-strip .dk-used-frac {
           font-size: 13.5px;
-          font-weight: 500;
-          color: var(--foreground, #18181b);
-          color: color-mix(in srgb, var(--foreground, #18181b) 88%, transparent);
+          font-weight: 400;
+          color: var(--muted-foreground, #8e8e93);
           font-variant-numeric: tabular-nums;
         }
         #deck-metrics-strip .dk-track {
@@ -322,144 +380,249 @@ function pageMount(d) {
           border-radius: 999px;
           transition: width 0.25s ease;
         }
-        #deck-metrics-strip .dk-list {
+        #deck-metrics-strip .dk-list,
+        #deck-metrics-strip .turn-bar-list {
           display: grid;
-          grid-template-columns: 1fr auto minmax(44px, auto);
-          row-gap: 6px;
-          column-gap: 8px;
+          grid-template-columns: repeat(4, minmax(0, 1fr));
+          align-items: start;
+          gap: 4px;
+        }
+        #deck-metrics-strip .turn-bar-list {
+          grid-template-columns: minmax(calc((100% - 12px) / 4), max-content) minmax(0, 1fr) calc((100% - 12px) / 4) calc((100% - 12px) / 4);
+        }
+        #deck-metrics-strip .dk-item-row,
+        #deck-metrics-strip .turn-bar-item {
+          display: grid;
+          grid-template-columns: auto minmax(0, 1fr);
           align-items: center;
+          column-gap: 5px;
+          row-gap: 2px;
+          min-width: 0;
         }
-        #deck-metrics-strip .dk-item-row {
-          display: contents;
-        }
-        #deck-metrics-strip .dk-item-left {
+        #deck-metrics-strip .dk-item-body {
           display: flex;
-          align-items: center;
-          gap: 7px;
-          color: var(--muted-foreground, #8e8e93);
-          white-space: nowrap;
+          flex-direction: column;
+          gap: 2px;
+          min-width: 0;
         }
-        #deck-metrics-strip .dk-dot {
-          width: 10px;
-          height: 10px;
-          border-radius: 3px;
+        #deck-metrics-strip .dk-item-label,
+        #deck-metrics-strip .turn-bar-label,
+        #deck-metrics-strip .turn-bar-short {
+          color: var(--muted-foreground, #8e8e93);
+          font-size: 13.5px;
+          line-height: 1.25;
+          white-space: nowrap;
+          overflow: hidden;
+          text-overflow: ellipsis;
+        }
+        #deck-metrics-strip .turn-bar-item[data-turn-row="requests"] {
+          container-type: inline-size;
+        }
+        #deck-metrics-strip .turn-bar-short {
+          display: none;
+        }
+        @container (max-width: 39px) {
+          #deck-metrics-strip .turn-bar-item[data-turn-row="requests"] .turn-bar-label {
+            display: none;
+          }
+          #deck-metrics-strip .turn-bar-item[data-turn-row="requests"] .turn-bar-short {
+            display: block;
+          }
+        }
+        #deck-metrics-strip .dk-item-row > .dk-dot,
+        #deck-metrics-strip .turn-bar-line {
+          grid-row: 1 / span 2;
+          align-self: stretch;
+          width: 2.5px;
+          margin: 2px 0;
+          border-radius: 99px;
           flex-shrink: 0;
         }
-        #deck-metrics-strip .dk-item-pct {
-          text-align: right;
-          justify-self: end;
-          color: var(--muted-foreground, #8e8e93);
-          white-space: nowrap;
-          font-variant-numeric: tabular-nums;
-          font-size: 13.5px;
-          margin-right: 6px;
+        #deck-metrics-strip .turn-bar-line {
+          background: rgba(142, 142, 147, 0.42);
+          background: color-mix(in srgb, var(--muted-foreground, #8e8e93) 55%, transparent);
         }
-        #deck-metrics-strip .dk-item-k {
-          text-align: right;
-          justify-self: end;
+        #deck-metrics-strip .dk-item-row > .dk-dot { grid-row: 1; }
+        #deck-metrics-strip .dk-item-k,
+        #deck-metrics-strip .dk-item-pct,
+        #deck-metrics-strip .turn-bar-val {
+          grid-column: 2;
           color: var(--muted-foreground, #8e8e93);
           white-space: nowrap;
           font-variant-numeric: tabular-nums;
           font-size: 13.5px;
+          font-weight: 400;
+          line-height: 1.25;
         }
         /* Quota Popover (matches plugin UI) */
         #deck-metrics-strip .dk-quota-pop {
           width: max-content;
         }
-        #deck-metrics-strip .dk-q-group {
-          margin-bottom: 8px;
+        #deck-metrics-strip[data-quota-indicator="bar"] .dk-quota-pop {
+          min-width: min(228px, var(--dk-pop-max-width, calc(100vw - 16px)));
         }
-        #deck-metrics-strip .dk-q-group:last-child {
-          margin-bottom: 0;
+        /* One grid for the whole popover; groups, rows and the pct+indicator
+           cell are subgrids, so every column lines up across all groups. */
+        #deck-metrics-strip .dk-quota-pop > .dk-panel-content {
+          display: grid;
+          grid-template-columns: minmax(54px, max-content) max-content max-content minmax(0, max-content);
+          column-gap: 8px;
+          align-content: start;
+        }
+        #deck-metrics-strip[data-quota-indicator="bar"] .dk-quota-pop > .dk-panel-content {
+          grid-template-columns: minmax(54px, max-content) max-content minmax(48px, 1fr) minmax(0, max-content);
+        }
+        #deck-metrics-strip[data-language^="zh"] .dk-quota-pop > .dk-panel-content {
+          grid-template-columns: minmax(42px, max-content) max-content max-content minmax(0, max-content);
+        }
+        #deck-metrics-strip[data-language^="zh"][data-quota-indicator="bar"] .dk-quota-pop > .dk-panel-content {
+          grid-template-columns: minmax(42px, max-content) max-content minmax(48px, 1fr) minmax(0, max-content);
+        }
+        #deck-metrics-strip .dk-q-group,
+        #deck-metrics-strip .dk-q-row {
+          grid-column: 1 / -1;
+          display: grid;
+          grid-template-columns: subgrid;
+          align-items: center;
         }
         #deck-metrics-strip .dk-q-title {
+          grid-column: 1 / -1;
           font-size: 13.5px;
           font-weight: 500;
           line-height: 1.25;
           color: var(--foreground, #18181b);
           color: color-mix(in srgb, var(--foreground, #18181b) 88%, transparent);
-          margin-bottom: 0px;
         }
         #deck-metrics-strip .dk-q-row {
-          display: grid;
-          grid-template-columns: minmax(54px, auto) 50px 48px;
-          align-items: center;
-          column-gap: 8px;
           font-size: 13.5px;
           font-variant-numeric: tabular-nums;
-          margin-bottom: 2px;
-        }
-        #deck-metrics-strip .dk-q-row:last-child {
-          margin-bottom: 0;
         }
         #deck-metrics-strip .dk-q-label {
           color: var(--muted-foreground, #8e8e93);
-          white-space: nowrap;
         }
         #deck-metrics-strip .dk-q-mid {
+          grid-column: 4;
           text-align: left;
           color: var(--muted-foreground, #8e8e93);
-          white-space: nowrap;
         }
         #deck-metrics-strip .dk-q-right {
-          display: flex;
-          justify-content: flex-end;
+          grid-column: 2 / 4;
+          display: grid;
+          grid-template-columns: subgrid;
           align-items: center;
-          gap: 5px;
+          column-gap: 5px;
           color: var(--muted-foreground, #8e8e93);
           white-space: nowrap;
         }
+        /* Optional presentation inspired by z21100644/agy-capsule PR #1.
+           Both styles use the existing four-category telemetry, unchanged. */
+        #deck-metrics-strip .dk-q-group { transition: opacity .2s ease; }
+        #deck-metrics-strip[data-highlight-active-model="true"] .dk-q-group[data-active="false"] { opacity: .7; }
+        #deck-metrics-strip .dk-q-pct { justify-self: end; }
+        #deck-metrics-strip .dk-q-meter { min-width: 24px; height: 4px; border-radius: 99px; overflow: hidden; background: rgba(142,142,147,.24); }
+        #deck-metrics-strip .dk-q-meter > span { display: block; height: 100%; border-radius: inherit; }
+        #deck-metrics-strip .dk-q-active { display: inline-block; width: 0; height: 4px; flex-shrink: 0; border-radius: 50%; background: currentColor; margin-left: 0; vertical-align: middle; align-self: center; opacity: 0; transform: scale(.5); transition: opacity .2s ease, transform .2s ease, width .2s ease, margin-left .2s ease; }
+        #deck-metrics-strip[data-highlight-active-model="true"] .dk-q-group[data-active="true"] .dk-q-active { width: 4px; margin-left: 4px; opacity: 1; transform: scale(1); }
+        /* Shared spacing rules; indicator and marker are independent. */
+        #deck-metrics-strip .dk-list { row-gap: var(--agy-row-gap); }
+        #deck-metrics-strip .dk-cache-bar { padding-bottom: var(--agy-section-gap); margin-bottom: var(--agy-section-gap); }
+        #deck-metrics-strip .dk-generation { margin-top: var(--agy-section-gap); padding-top: var(--agy-section-gap); }
+        #deck-metrics-strip [data-generation-block]:not([hidden]) + [data-turn-metrics-block] { border-top: 0; padding-top: 0; margin-top: var(--agy-section-gap); }
+        #deck-metrics-strip .generation-heading { margin-bottom: var(--agy-row-gap); }
+        #deck-metrics-strip .dk-q-group { margin: 0; }
+        #deck-metrics-strip .dk-q-group + .dk-q-group { margin-top: calc(var(--agy-section-gap) + 4px); padding-top: 0; border-top: 0; }
+        #deck-metrics-strip .dk-q-title { margin-bottom: var(--agy-row-gap); }
+        #deck-metrics-strip .dk-q-row { margin-bottom: var(--agy-row-gap); }
+        #deck-metrics-strip .dk-q-row:last-child { margin-bottom: 0; }
+        #deck-metrics-strip[data-panel-layout="matched"] .dk-ctx-pop > .dk-panel-content { height: 100%; display: flex; flex-direction: column; justify-content: space-between; }
+        #deck-metrics-strip[data-panel-layout="matched"] .dk-quota-pop > .dk-panel-content { height: 100%; align-content: space-between; }
+        #deck-metrics-strip[data-label-case="lowercase"] .dk-cache-left,
+        #deck-metrics-strip[data-label-case="lowercase"] .dk-used-pct,
+        #deck-metrics-strip[data-label-case="lowercase"] .dk-item-label,
+        #deck-metrics-strip[data-label-case="lowercase"] .turn-bar-label,
+        #deck-metrics-strip[data-label-case="lowercase"] .turn-bar-short,
+        #deck-metrics-strip[data-label-case="lowercase"] .dk-q-label { text-transform: lowercase; }
+        /* Context breakdown / turn metrics: columns (vertical lines) or rows (marker + label + values). */
+        #deck-metrics-strip:not([data-context-layout="rows"]) .dk-item-pct { display: none; }
+        #deck-metrics-strip[data-column-percent="true"]:not([data-context-layout="rows"]) .dk-item-pct { display: block; }
+        #deck-metrics-strip[data-column-label="false"]:not([data-context-layout="rows"]) .dk-item-label,
+        #deck-metrics-strip[data-column-value="false"]:not([data-context-layout="rows"]) .dk-item-k { display: none; }
+        #deck-metrics-strip[data-context-layout="rows"] .dk-list { grid-template-columns: auto minmax(0, 1fr) auto auto; column-gap: 8px; align-items: center; }
+        #deck-metrics-strip[data-context-layout="rows"] .dk-item-row,
+        #deck-metrics-strip[data-turn-layout="rows"] .turn-bar-item { grid-column: 1 / -1; display: grid; grid-template-columns: subgrid; align-items: center; }
+        #deck-metrics-strip[data-context-layout="rows"] .dk-item-body { grid-column: 2 / -1; display: grid; grid-template-columns: subgrid; align-items: center; }
+        #deck-metrics-strip[data-context-layout="rows"] .dk-item-label { grid-column: 1; grid-row: 1; }
+        #deck-metrics-strip[data-context-layout="rows"] .dk-item-pct { grid-column: 2; grid-row: 1; justify-self: end; }
+        #deck-metrics-strip[data-context-layout="rows"] .dk-item-k { grid-column: 3; grid-row: 1; justify-self: end; }
+        #deck-metrics-strip[data-turn-layout="rows"] .turn-bar-list { grid-template-columns: auto minmax(0, 1fr) auto; column-gap: 8px; row-gap: var(--agy-row-gap); align-items: center; }
+        #deck-metrics-strip[data-turn-layout="rows"] .turn-bar-label { grid-column: 2; grid-row: 1; display: block; }
+        #deck-metrics-strip[data-turn-layout="rows"] .turn-bar-short { display: none; }
+        #deck-metrics-strip[data-turn-layout="rows"] .turn-bar-item[data-turn-row="requests"] { container-type: normal; }
+        #deck-metrics-strip[data-context-layout="rows"] .dk-item-pct { margin-right: 4px; }
+        #deck-metrics-strip[data-turn-layout="rows"] .turn-bar-val { grid-column: 3; grid-row: 1; justify-self: end; }
+        #deck-metrics-strip[data-context-layout="rows"] .dk-item-row > .dk-dot,
+        #deck-metrics-strip[data-turn-layout="rows"] .turn-bar-line { grid-column: 1; grid-row: 1; align-self: center; width: 10px; height: 10px; margin: 0; border-radius: 3px; }
+        #deck-metrics-strip[data-context-marker="dot"][data-context-layout="rows"] .dk-item-row > .dk-dot,
+        #deck-metrics-strip[data-turn-marker="dot"][data-turn-layout="rows"] .turn-bar-line { border-radius: 50%; }
+        #deck-metrics-strip[data-show-context-breakdown="false"] .dk-list { display: none; }
+        #deck-metrics-strip .dk-item-label { order: var(--agy-order-label, 0); }
+        #deck-metrics-strip .dk-item-k { order: var(--agy-order-value, 1); }
+        #deck-metrics-strip .dk-item-pct { order: var(--agy-order-percent, 2); }
       </style>
 
       <!-- Context Capsule + Popover -->
       <div class="dk-grp" data-el="grpCtx">
-        <div class="dk-pill">
+        <button type="button" class="dk-pill" aria-expanded="false">
           <svg class="dk-svg" data-el="ctxIconSvg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
           <span class="dk-val" data-k="pillCtx">--%</span>
-        </div>
+          <span class="dk-speed" data-el="pillSpeed" hidden><span class="dk-speed-dot" aria-hidden="true"></span><span data-generation="speed"></span></span>
+        </button>
         <div class="dk-pop dk-ctx-pop">
+          <div class="dk-panel-content">
           <div class="dk-cache-bar" data-el="rowCacheHit">
-            <div class="dk-cache-left"><span class="dk-dot" data-el="dotCached" style="display:inline-flex;align-items:center;justify-content:center;background:transparent"></span><span>Cache</span><span class="dk-cache-pct" data-k="valCacheHit" data-el="valCacheHitEl">0%</span></div>
+            <div class="dk-cache-left"><span data-i18n="cache">Cache</span><span class="dk-cache-pct" data-k="valCacheHit" data-el="valCacheHitEl">0%</span><span class="dk-dot" data-el="dotCached" style="display:inline-flex;align-items:center;justify-content:center;background:transparent"></span></div>
+            <span class="dk-cache-meter" data-el="cacheMeter" hidden><span data-el="cacheMeterFill"></span></span>
             <div class="dk-cache-k" data-k="valCacheHitK"></div>
           </div>
           <div class="dk-summary-row">
-            <div class="dk-used-pct" data-k="usedPctText">0% used</div>
-            <div class="dk-used-frac" data-k="usedFrac">0 / --</div>
+            <div class="dk-used-pct" data-context-tip="overview"><span data-k="usedPctText">0%</span> <span data-i18n="used">used</span></div>
+            <div class="dk-used-frac" data-k="usedFrac" data-context-tip="overview">0 / --</div>
           </div>
-          <div class="dk-track">
+          <div class="dk-track" data-context-tip="overview">
             <div class="dk-seg" data-el="segTurn0" style="width: 0%; background: #d4940a"></div>
             <div class="dk-seg" data-el="segRead" style="width: 0%; background: #388bfd"></div>
             <div class="dk-seg" data-el="segThink" style="width: 0%; background: #00b386"></div>
             <div class="dk-seg" data-el="segOut" style="width: 0%; background: #e86a24"></div>
           </div>
           <div class="dk-list">
-            <div class="dk-item-row">
-              <div class="dk-item-left"><span class="dk-dot" style="background:#d4940a"></span><span>Turn0</span></div>
-              <div class="dk-item-pct" data-k="valTurn0Pct">0%</div>
-              <div class="dk-item-k" data-k="valTurn0K">0.0k</div>
+            <div class="dk-item-row" data-context-tip="turn0">
+              <span class="dk-dot" style="background:#d4940a"></span>
+              <div class="dk-item-body"><span class="dk-item-label" data-i18n="turn0">Turn0</span><span class="dk-item-k" data-k="valTurn0K">0</span><span class="dk-item-pct" data-k="valTurn0Pct">0%</span></div>
             </div>
-            <div class="dk-item-row">
-              <div class="dk-item-left"><span class="dk-dot" style="background:#388bfd"></span><span>Read</span></div>
-              <div class="dk-item-pct" data-k="valReadPct">0%</div>
-              <div class="dk-item-k" data-k="valReadK">0.0k</div>
+            <div class="dk-item-row" data-context-tip="read">
+              <span class="dk-dot" style="background:#388bfd"></span>
+              <div class="dk-item-body"><span class="dk-item-label" data-i18n="read">Read</span><span class="dk-item-k" data-k="valReadK">0</span><span class="dk-item-pct" data-k="valReadPct">0%</span></div>
             </div>
-            <div class="dk-item-row">
-              <div class="dk-item-left"><span class="dk-dot" style="background:#00b386"></span><span>Think</span></div>
-              <div class="dk-item-pct" data-k="valThinkPct">0%</div>
-              <div class="dk-item-k" data-k="valThinkK">0.0k</div>
+            <div class="dk-item-row" data-context-tip="think">
+              <span class="dk-dot" style="background:#00b386"></span>
+              <div class="dk-item-body"><span class="dk-item-label" data-i18n="think">Think</span><span class="dk-item-k" data-k="valThinkK">0</span><span class="dk-item-pct" data-k="valThinkPct">0%</span></div>
             </div>
-            <div class="dk-item-row">
-              <div class="dk-item-left"><span class="dk-dot" style="background:#e86a24"></span><span>Write</span></div>
-              <div class="dk-item-pct" data-k="valOutPct">0%</div>
-              <div class="dk-item-k" data-k="valOutK">0.0k</div>
+            <div class="dk-item-row" data-context-tip="write">
+              <span class="dk-dot" style="background:#e86a24"></span>
+              <div class="dk-item-body"><span class="dk-item-label" data-i18n="write">Write</span><span class="dk-item-k" data-k="valOutK">0</span><span class="dk-item-pct" data-k="valOutPct">0%</span></div>
             </div>
+          </div>
+          <div class="dk-generation" data-generation-block>
+            ${presentation.generationMarkup()}
+          </div>
+          ${presentation.turnMetricsMarkup('dk-generation')}
           </div>
         </div>
       </div>
 
       <!-- Merged Quota Capsule (5h + Weekly) + Popover -->
       <div class="dk-grp" data-el="grpQuota">
-        <div class="dk-pill dk-pill-quota">
+        <button type="button" class="dk-pill dk-pill-quota" aria-expanded="false">
           <span class="dk-q-pair" data-el="pair5h">
             <svg class="dk-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15.5 14"/></svg>
             <span class="dk-val" data-k="pill5h">--%</span>
@@ -468,33 +631,214 @@ function pageMount(d) {
             <svg class="dk-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>
             <span class="dk-val" data-k="pillWk">--%</span>
           </span>
-        </div>
+        </button>
         <div class="dk-pop dk-quota-pop" data-el="quotaPop"></div>
+      </div>
+      <div class="dk-grp" data-el="grpError" data-alert-mode="none" hidden>
+        <button type="button" class="dk-pill" aria-expanded="false">
+          <svg class="dk-svg" data-alert-icon="error" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 7v6"/><circle cx="12" cy="17" r=".6" fill="currentColor"/></svg>
+          <svg class="dk-svg" data-alert-icon="queue" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15.5 14"/></svg>
+          <span class="dk-val" data-request-error="label"></span>
+        </button>
+        <div class="dk-pop dk-error-pop">
+          <div class="dk-error-heading" data-request-error="heading"></div>
+          <div data-request-error="detail"></div>
+          <div class="dk-error-diagnostic" data-request-error="diagnostic"></div>
+        </div>
       </div>
     `;
 
+    // Only native layout integration stays outside the shadow boundary.
+    let nativeStyle = document.getElementById('agy-capsule-native-layout');
+    if (!nativeStyle) {
+      nativeStyle = document.createElement('style');
+      nativeStyle.id = 'agy-capsule-native-layout';
+      document.head.appendChild(nativeStyle);
+    }
+    nativeStyle.textContent = `
+        .agy-composer-footer button[data-deck-turbo-collapsed="true"] {
+          width: 28px !important; min-width: 28px !important; max-width: 28px !important;
+          padding: 6px !important; gap: 0 !important; justify-content: center !important;
+        }
+        .agy-composer-footer button[data-deck-turbo-collapsed="true"] > :not(:first-child) { display: none !important; }
+        .agy-composer-footer button[data-deck-turbo-collapsed="true"] > svg:first-child { width: 16px !important; height: 16px !important; flex-shrink: 0 !important; }
+        .agy-composer-footer .dk-fl-squeezed {
+          min-width: 0 !important;
+          flex-shrink: 1 !important;
+        }
+        .agy-composer-footer .dk-model-squeezed {
+          min-width: 0 !important;
+          flex: 0 1 auto !important;
+          overflow: hidden !important;
+          max-width: 100% !important;
+        }
+        .agy-composer-footer .dk-model-squeezed .dk-squeeze-box,
+        .agy-composer-footer .dk-model-squeezed .dk-squeeze-item {
+          min-width: 0 !important;
+          max-width: 100% !important;
+          overflow: hidden !important;
+          text-overflow: ellipsis !important;
+          white-space: nowrap !important;
+        }
+        .agy-composer-footer .dk-model-squeezed .dk-squeeze-box,
+        .agy-composer-footer .dk-model-squeezed-hard .dk-squeeze-item {
+          flex-shrink: 1 !important;
+        }
+        .agy-composer-footer .dk-model-squeezed svg {
+          flex-shrink: 0 !important;
+        }
+    `;
+    root._dispose = () => {
+      release(root);
+      nativeStyle.remove();
+      host.remove();
+      if (window.__agyCapsuleCleanup === root._dispose) delete window.__agyCapsuleCleanup;
+    };
+    window.__agyCapsuleCleanup = root._dispose;
+
+    const closePinned = (dismiss = false) => {
+      const pinned = root._pinnedGroup;
+      if (pinned) {
+        pinned.removeAttribute('data-pinned');
+        if (dismiss) pinned.dataset.dismissed = 'true';
+        pinned.querySelector('.dk-pill').setAttribute('aria-expanded', 'false');
+      }
+      root._pinnedGroup = null;
+      root.removeAttribute('data-pinned');
+    };
+    root._layoutPopovers = (grp = root._pinnedGroup || root.querySelector('.dk-grp:hover')) => {
+      const pop = grp?.querySelector('.dk-pop');
+      if (!pop && root.dataset.panelLayout !== 'matched') {
+        root._fitPanelHeights?.();
+        return;
+      }
+      // Constrain width before measuring heights or positioning; moving a panel
+      // alone cannot make it fit inside a narrower clipping ancestor.
+      let minLeft = 8;
+      let maxRight = window.innerWidth - 8;
+      for (let el = root; el && el !== document.documentElement; el = el.parentElement || el.getRootNode().host) {
+        const cs = getComputedStyle(el);
+        if (cs.overflowX === 'visible' && !/paint|strict|content/.test(cs.contain)) continue;
+        const innerLeft = el.getBoundingClientRect().left + el.clientLeft;
+        minLeft = Math.max(minLeft, innerLeft + 4);
+        maxRight = Math.min(maxRight, innerLeft + el.clientWidth - 4);
+      }
+      const limit = `${Math.max(0, maxRight - minLeft)}px`;
+      if (root.style.getPropertyValue('--dk-pop-max-width') !== limit) root.style.setProperty('--dk-pop-max-width', limit);
+      root._fitPanelHeights?.();
+      const width = pop?.getBoundingClientRect().width;
+      if (!width) return;
+      const pill = grp.querySelector('.dk-pill').getBoundingClientRect();
+      const stripLeft = root.getBoundingClientRect().left;
+      let left = Math.max(stripLeft, pill.right - width);
+      left = Math.max(minLeft, Math.min(left, maxRight - width));
+      pop.style.left = (left - grp.getBoundingClientRect().left) + 'px';
+    };
     for (const grp of root.querySelectorAll('.dk-grp')) {
       grp.addEventListener('mouseenter', () => {
-        const pop = grp.querySelector('.dk-pop');
-        if (!pop) return;
-        pop.style.left = '';
-        const pr = pop.getBoundingClientRect();
-        if (pr.width <= 0) return;
-        const maxRight = window.innerWidth - 8;
-        if (pr.right > maxRight) {
-          pop.style.left = Math.max(-pr.left + 8, maxRight - pr.right) + 'px';
-        }
+        root._refreshCacheTooltip?.();
+        grp.removeAttribute('data-dismissed');
+        if (!root._pinnedGroup || root._pinnedGroup === grp) grp.querySelector('.dk-pill').setAttribute('aria-expanded', 'true');
+        root._layoutPopovers(root._pinnedGroup || grp);
       });
       grp.addEventListener('mouseleave', () => {
+        grp.removeAttribute('data-dismissed');
+        if (root._pinnedGroup === grp) return;
+        grp.querySelector('.dk-pill').setAttribute('aria-expanded', 'false');
         const pop = grp.querySelector('.dk-pop');
         if (pop) pop.style.left = '';
       });
+      grp.querySelector('.dk-pill').addEventListener('click', (event) => {
+        event.stopPropagation();
+        root._refreshCacheTooltip?.();
+        const wasPinned = root._pinnedGroup === grp;
+        closePinned();
+        if (wasPinned) {
+          grp.dataset.dismissed = 'true';
+        } else {
+          grp.removeAttribute('data-dismissed');
+          grp.dataset.pinned = 'true';
+          root.dataset.pinned = 'true';
+          root._pinnedGroup = grp;
+          grp.querySelector('.dk-pill').setAttribute('aria-expanded', 'true');
+          root._layoutPopovers(grp);
+        }
+      });
     }
+    root._onOutsideClick = (event) => { if (!event.composedPath().includes(root)) closePinned(); };
+    root._onEscape = (event) => {
+      if (event.key !== 'Escape') return;
+      closePinned(true);
+      for (const grp of root.querySelectorAll('.dk-grp')) {
+        grp.dataset.dismissed = 'true';
+        grp.querySelector('.dk-pill').setAttribute('aria-expanded', 'false');
+      }
+    };
+    document.addEventListener('click', root._onOutsideClick);
+    document.addEventListener('keydown', root._onEscape);
+    root._onResize = () => root._scheduleLayout?.();
+    window.addEventListener('resize', root._onResize);
+    root.querySelector('[data-el="rowCacheHit"]').addEventListener('mouseenter', () => root._refreshCacheTooltip?.());
   }
 
-  if (!footerLeft.contains(root)) {
-    footerLeft.appendChild(root);
+  if (!footerLeft.contains(host)) {
+    footerLeft.appendChild(host);
   }
+  const labels = presentation.apply(root, d.prefs);
+  presentation.renderContextTooltips(root, d.contextData, labels);
+  const now = Date.now();
+  const cancelBtnVisible = !!footerLeft.parentElement.querySelector('[data-testid="input-cancel-button"]');
+  const alerts = presentation.renderAlerts(root, { ...d.contextData, requestError: d.requestError, turnQueue: d.turnQueue }, d.prefs, labels, now, cancelBtnVisible || !!d.turnQueue?.hasPendingPlanner);
+  root.querySelector('[data-el="grpQuota"]').hidden = d.cloudPaygo;
+  if (root._pinnedGroup?.hidden) {
+    root._pinnedGroup.removeAttribute('data-pinned');
+    root._pinnedGroup.querySelector('.dk-pill').setAttribute('aria-expanded', 'false');
+    root._pinnedGroup = null;
+    root.removeAttribute('data-pinned');
+  }
+  root._refreshCacheTooltip = () => {
+    root.querySelector('[data-el="rowCacheHit"]').title = presentation.cacheTooltip(d.cache, labels, Date.now(), d.prefs);
+  };
+  root._refreshCacheTooltip();
+  presentation.renderGeneration(root.querySelector('.dk-ctx-pop'), d.generation, labels, d.prefs);
+  presentation.renderTurnMetrics(root, d.turnMetrics, labels, d.prefs);
+  const pillSpeed = root.querySelector('[data-el="pillSpeed"]');
+  const tps = d.turnSpeed?.generation?.tps;
+  // Turn scope comes from persisted USER_INPUT, not cancel-button appearance.
+  // Activity and the last completed request's speed are independent signals.
+  const turnKey = location.pathname + ':' + (d.turnSpeed?.userStepIndex ?? 'none');
+  const requestIndex = d.turnSpeed?.generation?.requestIndex ?? null;
+  const running = !!d.turnSpeed?.hasActiveStep || cancelBtnVisible;
+  const hasSpeed = Number.isFinite(tps) && tps >= 0;
+  const motionEnabled = d.prefs?.speedAnimation === true;
+  pillSpeed.hidden = d.prefs?.showSpeed === false || (!d.turnSpeed && !running);
+  const speedValue = pillSpeed.querySelector('[data-generation="speed"]');
+  const speedText = hasSpeed ? tps.toFixed(1) + ' tok/s' : '—';
+  if (speedValue.textContent !== speedText) speedValue.textContent = speedText;
+  let activity = root._speedActivity;
+  if (!activity || activity.turnKey !== turnKey) {
+    activity = root._speedActivity = { turnKey, running: false, requestIndex: null, coolUntil: 0 };
+  }
+  if (running) activity.coolUntil = 0;
+  else if (activity.running) activity.coolUntil = now + 15000;
+  else if (requestIndex !== null && requestIndex !== activity.requestIndex) {
+    // Use response completion time, not unrelated tool activity.
+    const recordedAt = d.turnSpeed?.completedAtMs || 0;
+    if (recordedAt > 0 && recordedAt <= now) activity.coolUntil = Math.max(activity.coolUntil, recordedAt + 15000);
+  }
+  activity.running = running;
+  activity.requestIndex = requestIndex;
+  if (motionEnabled && !pillSpeed.hidden) {
+    pillSpeed.dataset.motion = running ? 'active' : activity.coolUntil > now ? 'recent' : 'idle';
+    pillSpeed.dataset.tier = hasSpeed ? (tps >= 25 ? 'green' : tps >= 10 ? 'yellow' : 'red') : 'unknown';
+  } else {
+    pillSpeed.removeAttribute('data-motion');
+    pillSpeed.removeAttribute('data-tier');
+  }
+  const contextPill = root.querySelector('[data-el="grpCtx"] .dk-pill');
+  contextPill.setAttribute('aria-label', labels.context);
+  for (const node of [contextPill, ...contextPill.querySelectorAll('[title]')]) node.removeAttribute('title');
+  root.querySelector('[data-el="grpQuota"] .dk-pill').setAttribute('aria-label', labels.quota);
 
   const setK = (k, val) => {
     const el = root.querySelector(`[data-k="${k}"]`);
@@ -502,25 +846,61 @@ function pageMount(d) {
   };
 
   setK('pillCtx', d.pillCtx);
-  setK('usedPctText', d.usedPctText);
+  setK('usedPctText', d.pillCtx);
   setK('usedFrac', d.usedFrac);
   setK('valCacheHit', d.valCacheHit);
   setK('valCacheHitK', d.valCacheHitK || '');
-  setK('valTurn0Pct', d.valTurn0Pct);
   setK('valTurn0K', d.valTurn0K);
-  setK('valReadPct', d.valReadPct);
   setK('valReadK', d.valReadK);
-  setK('valThinkPct', d.valThinkPct);
   setK('valThinkK', d.valThinkK);
-  setK('valOutPct', d.valOutPct);
   setK('valOutK', d.valOutK);
+  setK('valTurn0Pct', d.valTurn0Pct);
+  setK('valReadPct', d.valReadPct);
+  setK('valThinkPct', d.valThinkPct);
+  setK('valOutPct', d.valOutPct);
 
   // Match active model to quota pills
   root._deckQuotas = d;
+  // Reveals reserve their final width before fitting the footer. Animating layout
+  // width from zero lets the fit check pass too early and overlap native buttons.
+  // Leaving items may shrink; they never need more room than the fitted layout.
+  const motion = (key, el, restore) => {
+    const state = root._motionPrev || (root._motionPrev = {});
+    // Still collapsing: a later re-render hiding it again must not cut the animation short.
+    if (el._leaving) {
+      if (el.hidden) { el.hidden = false; return; }
+      el._leaving.cancel(); el._leaving = null;
+    }
+    const visible = !el.hidden;
+    const text = el.textContent;
+    const width = visible ? el.getBoundingClientRect().width : 0;
+    const p = state[key];
+    state[key] = { visible, text, width };
+    if (!p || matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+    if (visible === p.visible && (!visible || text === p.text)) return;
+    for (const a of el.getAnimations()) a.cancel();
+    const gap = parseFloat(getComputedStyle(el.parentElement).columnGap) || 0;
+    // Cancel the gap on the side that has a neighbour, so a leading item doesn't slide outside its capsule.
+    const prevSib = el.previousElementSibling;
+    const side = prevSib && !prevSib.hidden && getComputedStyle(prevSib).display !== 'none' ? 'marginLeft' : 'marginRight';
+    const box = (w, o, m) => ({ overflow: 'hidden', whiteSpace: 'nowrap', maxWidth: w + 'px', minWidth: Math.min(w, width || w) + 'px', opacity: o, [side]: m + 'px' });
+    const timing = { duration: 220, easing: 'ease' };
+    if (visible && !p.visible) {
+      el.animate([{ opacity: 0, clipPath: 'inset(0 100% 0 0)' }, { opacity: 1, clipPath: 'inset(0)' }], timing);
+    } else if (!visible && p.visible) {
+      el.hidden = false;
+      restore?.(p.text); // collapse what was shown, not the cleared value
+      const out = el.animate([{ ...box(p.width, 1, 0), minWidth: '0px' }, { ...box(0, 0, -gap), minWidth: '0px' }], { ...timing, fill: 'forwards' });
+      el._leaving = out;
+      out.onfinish = () => { el._leaving = null; el.hidden = true; out.cancel(); root._scheduleLayout?.(); };
+    } else if (Math.abs(width - p.width) > 0.5) {
+      el.animate([{ opacity: 0.35 }, { opacity: 1 }], { duration: 180, easing: 'ease' });
+    }
+  };
   const applyModelQuota = () => {
     let mt = '';
     for (const child of footerLeft.children) {
-      if (child.id !== 'deck-metrics-strip' && child.textContent) {
+      if (child !== host && child.textContent) {
         mt += ' ' + child.textContent.trim();
       }
     }
@@ -561,11 +941,21 @@ function pageMount(d) {
     if (!matched) {
       matched = groups.find((g) => g.title === 'Gemini') || groups[0] || null;
     }
+    for (const group of root.querySelectorAll('.dk-q-group')) {
+      group.dataset.active = group.dataset.pool === matched?.rawName ? 'true' : 'false';
+    }
 
     const q5hVal = matched ? matched.q5h || '--%' : '--%';
     const qWkVal = matched ? matched.qWk || '--%' : '--%';
     setK('pill5h', q5hVal);
     setK('pillWk', qWkVal);
+    const hideAbsent = q.prefs?.hideUnavailableQuota === true;
+    const pair5h = root.querySelector('[data-el="pair5h"]');
+    const pairWk = root.querySelector('[data-el="pairWk"]');
+    pair5h.hidden = hideAbsent && q5hVal === '--%' && qWkVal !== '--%';
+    pairWk.hidden = hideAbsent && qWkVal === '--%' && q5hVal !== '--%';
+    motion('pair5h', pair5h);
+    motion('pairWk', pairWk);
     root.dataset.preferWkOnly = q5hVal === '--%' && qWkVal !== '--%' ? '1' : '0';
     return mt;
   };
@@ -577,7 +967,7 @@ function pageMount(d) {
     let svgClipped = false;
     const walk = (node, parentClip) => {
       const cs = getComputedStyle(node);
-      if (cs.display === 'none') return;
+      if (cs.display === 'none' || cs.visibility === 'hidden') return;
       if (cs.display === 'contents') {
         for (const child of node.children) walk(child, parentClip);
         return;
@@ -611,13 +1001,28 @@ function pageMount(d) {
   };
 
   const adjustLayout = () => {
+    if (root._adjustingLayout) return;
+    root._adjustingLayout = true;
+    try {
     const footer = footerLeft.parentElement;
-    const nativeChildren = Array.from(footerLeft.children).filter((c) => c !== root);
+    if (!footer || footer.getBoundingClientRect().width <= 0) return;
+    const visible = el => {
+      const style = getComputedStyle(el);
+      const rect = el.getBoundingClientRect();
+      return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+    };
+    const children = Array.from(footerLeft.children);
+    const nativeChildren = children.slice(0, children.indexOf(host)).filter(el => visible(el) || el.classList.contains('dk-model-squeezed'));
     const modelTargets = nativeChildren.filter((c) => c.textContent && c.textContent.trim().length > 0);
+    const turbo = footer.querySelector('[data-testid="permissions-selector-trigger"]');
+    if (root._turboTarget && root._turboTarget !== turbo) root._turboTarget.removeAttribute('data-deck-turbo-collapsed');
+    root._turboTarget = turbo;
 
     const isClippedEl = (el) => {
       if (el instanceof SVGElement) return false;
-      if (el.scrollWidth <= el.clientWidth + 1) return false;
+      const overflow = getComputedStyle(el).overflowX;
+      if (overflow !== 'hidden' && overflow !== 'clip') return false;
+      if (el.scrollWidth <= el.clientWidth + 2) return false;
       const r = el.getBoundingClientRect();
       return r.height > 0 && el.getClientRects().length > 0;
     };
@@ -660,21 +1065,32 @@ function pageMount(d) {
     };
 
     const compactCls = root.dataset.preferWkOnly === '1' ? 'dk-hide-5h' : 'dk-hide-wk';
-    const modeClasses = ['dk-hide-wk', 'dk-hide-5h', 'dk-hide-qval', 'dk-hide-cval', 'dk-hide-quota', 'dk-hide-all'];
+    const modeClasses = ['dk-hide-speed', 'dk-hide-wk', 'dk-hide-5h', 'dk-hide-qval', 'dk-hide-cval', 'dk-hide-quota', 'dk-hide-error-label', 'dk-hide-ctx', 'dk-hide-all'];
     const modes = [
       { classes: [], compress: '' },
-      { classes: [compactCls], compress: '' },
-      { classes: [compactCls, 'dk-hide-qval'], compress: '' },
-      { classes: [compactCls, 'dk-hide-qval', 'dk-hide-cval'], compress: '' },
-      { classes: [compactCls, 'dk-hide-qval', 'dk-hide-cval'], compress: 'soft' },
-      { classes: [compactCls, 'dk-hide-qval', 'dk-hide-cval'], compress: 'hard' },
-      { classes: ['dk-hide-cval', 'dk-hide-quota'], compress: 'hard' },
+      // First reserve width by collapsing the native Turbo selector to its shield.
+      // Keep it collapsed through ALL capsule stages, never alternate priorities.
+      ...(turbo ? [{ classes: [], compress: '' }] : []),
+      { classes: ['dk-hide-speed'], compress: '' },
+      ...(alerts.visible ? [{ classes: ['dk-hide-error-label'], compress: '' }] : []),
+      { classes: [compactCls, 'dk-hide-error-label'], compress: '' },
+      { classes: [compactCls, 'dk-hide-qval', 'dk-hide-error-label'], compress: '' },
+      { classes: [compactCls, 'dk-hide-qval', 'dk-hide-error-label', 'dk-hide-cval'], compress: '' },
+      { classes: [compactCls, 'dk-hide-qval', 'dk-hide-error-label', 'dk-hide-cval'], compress: 'soft' },
+      { classes: [compactCls, 'dk-hide-qval', 'dk-hide-error-label', 'dk-hide-cval'], compress: 'hard' },
+      { classes: ['dk-hide-cval', 'dk-hide-quota', 'dk-hide-error-label'], compress: 'hard' },
+      ...(alerts.visible ? [{ classes: ['dk-hide-ctx', 'dk-hide-quota', 'dk-hide-error-label'], compress: 'hard' }] : []),
       { classes: ['dk-hide-all'], compress: '' },
     ];
 
-    for (const mode of modes) {
+    for (const [modeIndex, mode] of modes.entries()) {
+      if (turbo) {
+        if (modeIndex > 0) turbo.setAttribute('data-deck-turbo-collapsed', 'true');
+        else turbo.removeAttribute('data-deck-turbo-collapsed');
+      }
+      const classes = mode.classes.length > 0 && !mode.classes.includes('dk-hide-speed') ? ['dk-hide-speed', ...mode.classes] : mode.classes;
       for (const cls of modeClasses) {
-        root.classList.toggle(cls, mode.classes.includes(cls));
+        root.classList.toggle(cls, classes.includes(cls));
       }
       syncSqueezeClasses(mode.compress);
       if (mode.classes.includes('dk-hide-all')) break;
@@ -683,7 +1099,12 @@ function pageMount(d) {
       if (rootRect.width <= 0) continue;
 
       const rightControls = footer
-        ? Array.from(footer.children).filter((el) => el !== footerLeft && el.getBoundingClientRect().width > 0)
+        ? Array.from(footer.children).filter((el) => {
+            if (el === footerLeft || !visible(el) || !(el.textContent.trim() || el.querySelector('button, svg, img, input, a, [role="button"]'))) return false;
+            const rect = el.getBoundingClientRect();
+            const left = footerLeft.getBoundingClientRect();
+            return rect.bottom > left.top + 2 && rect.top < left.bottom - 2;
+          })
         : [];
       const rightMinLeft =
         rightControls.length > 0
@@ -709,29 +1130,49 @@ function pageMount(d) {
         rootRect.right <= rightMinLeft - 4 &&
         rootRect.right <= footerRightEdge + 1 &&
         rootRect.right <= flClipRight;
-      const fitsLeft = nativeMaxRight === -Infinity || rootRect.left >= nativeMaxRight + 3;
+      const fitsLeft = nativeMaxRight === -Infinity || rootRect.left >= nativeMaxRight + 1;
       const crowdedModel = !mode.compress && minRightBound - rootRect.right < 24 && isNativeSqueezed();
       if (fitsRight && fitsLeft && !(mode.compress && anySvgClipped) && !crowdedModel) break;
     }
+    } finally {
+      root._adjustingLayout = false;
+    }
   };
-  root._adjustLayout = adjustLayout;
+  root._adjustLayout = () => {
+    adjustLayout();
+    root._layoutPopovers();
+  };
+  root._scheduleLayout = () => {
+    if (root._layoutRaf) return;
+    root._layoutRaf = requestAnimationFrame(() => {
+      root._layoutRaf = 0;
+      if (root.isConnected) root._adjustLayout();
+    });
+  };
 
   if (root._observedFooterLeft !== footerLeft) {
+    if (root._observedFooterLeft) clearFooterLayout(root);
     if (root._modelObserver) root._modelObserver.disconnect();
     if (root._resizeObserver) root._resizeObserver.disconnect();
     root._observedFooterLeft = footerLeft;
 
     const obs = new MutationObserver((mutations) => {
       if (mutations.every((m) => root.contains(m.target))) return;
+      const lateLegacy = document.getElementById('deck-metrics-strip');
+      if (lateLegacy) {
+        release(lateLegacy);
+        lateLegacy.remove();
+        if (globalThis.__agyCapsuleDeck) window.__deckOwnerTs = globalThis.__agyCapsuleDeck.owner;
+      }
       if (root._applyModelQuota) root._applyModelQuota();
-      if (root._adjustLayout) root._adjustLayout();
+      root._scheduleLayout?.();
     });
     obs.observe(footerLeft, { subtree: true, characterData: true, childList: true });
     root._modelObserver = obs;
 
     if (typeof ResizeObserver !== 'undefined') {
       const ro = new ResizeObserver(() => {
-        if (root._adjustLayout) root._adjustLayout();
+        root._scheduleLayout?.();
       });
       if (footerLeft.parentElement) ro.observe(footerLeft.parentElement);
       ro.observe(footerLeft);
@@ -755,6 +1196,15 @@ function pageMount(d) {
   if (dotCached && dotCached.innerHTML !== d.cacheIconSvg) {
     dotCached.innerHTML = d.cacheIconSvg;
   }
+  const cacheMeter = root.querySelector('[data-el="cacheMeter"]');
+  const cacheMeterFill = root.querySelector('[data-el="cacheMeterFill"]');
+  if (cacheMeter && cacheMeterFill) {
+    cacheMeter.hidden = d.cacheIndicator !== 'bar';
+    if (!cacheMeter.hidden) {
+      cacheMeterFill.style.width = d.cacheProgressPct || '0%';
+      cacheMeterFill.style.backgroundColor = d.cacheProgressColor || '';
+    }
+  }
   const valCacheHitEl = root.querySelector('[data-el="valCacheHitEl"]');
   if (valCacheHitEl) {
     valCacheHitEl.style.color = d.cacheValColor;
@@ -766,236 +1216,304 @@ function pageMount(d) {
     valCacheHitKEl.style.color = d.cacheValColor;
   }
 
+  motion('speed', pillSpeed, text => { speedValue.textContent = text.trim(); });
+  motion('error', root.querySelector('[data-el="grpError"]'));
+
   // Update Quota Popover HTML
   const quotaPop = root.querySelector('[data-el="quotaPop"]');
   if (quotaPop && quotaPop.innerHTML !== d.quotaHtml) {
     quotaPop.innerHTML = d.quotaHtml;
   }
+  presentation.apply(root, d.prefs);
+  applyModelQuota();
 
-  adjustLayout();
+  root._fitPanelHeights = () => {
+    // Only visible capsules participate in matched panel height.
+    const errorPop = root.querySelector('.dk-error-pop');
+    const pops = [root.querySelector('.dk-ctx-pop')];
+    if (!quotaPop.closest('.dk-grp').hidden) pops.push(quotaPop);
+    else quotaPop.style.height = '';
+    if (errorPop && !errorPop.closest('.dk-grp').hidden) pops.push(errorPop);
+    else if (errorPop) errorPop.style.height = '';
+    if (root.dataset.panelLayout !== 'matched') {
+      for (const pop of pops) pop.style.height = '';
+      root._heightKey = '';
+      return;
+    }
+    const key = JSON.stringify(d.prefs) + pops.map(pop => pop.textContent).join('|') + root.style.getPropertyValue('--dk-pop-max-width');
+    if (key === root._heightKey) return;
+    const previous = pops.map(pop => ({ display: pop.style.display, visibility: pop.style.visibility }));
+    root.dataset.panelLayout = 'natural';
+    for (const pop of pops) { pop.style.height = ''; pop.style.display = 'block'; pop.style.visibility = 'hidden'; }
+    const heights = pops.map(pop => pop.getBoundingClientRect().height);
+    root.dataset.panelLayout = 'matched';
+    for (const [index, pop] of pops.entries()) {
+      pop.style.display = previous[index].display;
+      pop.style.visibility = previous[index].visibility;
+      if (heights.every(height => height > 0)) pop.style.height = Math.max(...heights) + 'px';
+    }
+    if (heights.every(height => height > 0)) root._heightKey = key;
+  };
+  root._adjustLayout();
 
   return 'ok:' + modelText;
 }
 
-function fmtK(n) {
-  const num = Number(n || 0);
-  if (num < 1000) return String(num);
-  if (num >= 1000000) return (num / 1000000).toFixed(1).replace(/\.0$/, '') + 'M';
-  return (num / 1000).toFixed(1).replace(/\.0$/, '') + 'k';
-}
-
-function fmtColK(n) {
-  const num = Number(n || 0);
-  if (num >= 1000000) return (num / 1000000).toFixed(1).replace(/\.0$/, '') + 'M';
-  return (num / 1000).toFixed(1) + 'k';
-}
-
-function formatResetShort(isoStr) {
-  if (!isoStr) return '';
-  const diffMs = new Date(isoStr).getTime() - Date.now();
-  if (diffMs <= 0) return 'soon';
-  const totalMin = Math.floor(diffMs / 60000);
-  const d = Math.floor(totalMin / 1440);
-  const h = Math.floor((totalMin % 1440) / 60);
-  const m = totalMin % 60;
-  if (d > 0) return d + 'd ' + String(h).padStart(2, '0') + 'h';
-  if (h > 0) return h + 'h ' + String(m).padStart(2, '0') + 'm';
-  return String(Math.max(1, m)).padStart(2, '0') + 'm';
-}
-
-function makeRingSvg(frac) {
-  const clamped = Math.max(0, Math.min(1, Number(frac || 0)));
-  const r = 6.5;
-  const c = 2 * Math.PI * r;
-  const offset = c * (1 - clamped);
-  const color = clamped <= 0.1 ? '#ef4444' : clamped <= 0.25 ? '#f59e0b' : '#4ea84e';
-  return (
-    '<svg width="16" height="16" viewBox="0 0 18 18" style="transform: rotate(-90deg); flex-shrink: 0;">' +
-    '<circle cx="9" cy="9" r="' + r + '" fill="none" stroke="rgba(142,142,147,0.28)" stroke-width="2.2"/>' +
-    '<circle cx="9" cy="9" r="' + r + '" fill="none" stroke="' + color + '" stroke-width="2.2" stroke-linecap="round" ' +
-    'stroke-dasharray="' + c.toFixed(2) + '" stroke-dashoffset="' + offset.toFixed(2) + '"/>' +
-    '</svg>'
-  );
-}
-
-function formatGroupTitle(raw) {
-  const s = String(raw || '').trim();
-  if (s === 'Gemini Models') return 'Gemini';
-  if (s.toLowerCase().startsWith('claude')) return 'Claude';
-  return s;
-}
-
 function toView(d) {
-  const maxCtx = d.maxContextTokens || 0;
-  const ctx = d.contextTokens || 0;
-  const cached = d.cachedIn || 0;
-  const out = d.totalOutputTokens || 0;
-  const think = d.totalThinkingTokens || 0;
-  const turn0 = d.turn0Tokens || 0;
-  const read = Math.max(0, ctx - turn0 - out - think);
+  const ctx = contextBreakdown(d);
+  const cache = cacheView(d, d.prefs);
+  const { iconSvg: cacheIconSvg, valColor: cacheValColor, valDeco: cacheValDeco, valOp: cacheValOp, text: valCacheHit, countdown: valCacheHitK, ctxIconColor, indicator: cacheIndicator, progressPct: cacheProgressPct, progressColor: cacheProgressColor } = cache;
 
-  const hasMax = maxCtx > 0;
-  const usedPctRound = hasMax ? Math.round((ctx / maxCtx) * 100) : 0;
-  const usedPctExact = hasMax ? Math.min(100, (ctx / maxCtx) * 100) : 0;
-  const compSum = read + out + think + turn0;
-  const scale = compSum > 0 ? usedPctExact / compSum : 0;
-
-  const segReadW = (read * scale).toFixed(2) + '%';
-  const segOutW = (out * scale).toFixed(2) + '%';
-  const segThinkW = (think * scale).toFixed(2) + '%';
-  const segTurn0W = (turn0 * scale).toFixed(2) + '%';
-
-  const pctStr = (val) => (hasMax ? Math.round((val / maxCtx) * 100) + '%' : (ctx === 0 ? '0%' : '--%'));
-  const readPct = pctStr(read);
-  const outPct = pctStr(out);
-  const thinkPct = pctStr(think);
-  const turn0Pct = pctStr(turn0);
-  const cacheHitPct = ctx > 0 ? Math.round((cached / ctx) * 100) : 0;
-
-  const idleSec = ctx > 0 && d.lastStepEpochMs ? Math.max(0, Math.floor((Date.now() - d.lastStepEpochMs) / 1000)) : 0;
-  let cacheIconSvg =
-    '<svg width="10" height="10" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="2 6.5 4.8 9.2 10 3"/></svg>';
-  let cacheValColor = '';
-  let cacheValDeco = 'none';
-  let cacheValOp = '1';
-  let valCacheHit = cacheHitPct + '%';
-  let valCacheHitK = '';
-  let ctxIconColor = '';
-
-  if (idleSec >= 240) {
-    cacheIconSvg =
-      '<svg width="10" height="10" viewBox="0 0 12 12" fill="none" stroke="#e06c75" stroke-width="2" stroke-linecap="round"><line x1="2.2" y1="2.2" x2="9.8" y2="9.8"/><line x1="9.8" y1="2.2" x2="2.2" y2="9.8"/></svg>';
-    cacheValDeco = 'line-through';
-    cacheValOp = '0.5';
-    ctxIconColor = 'rgba(208, 122, 128, 0.88)';
-  } else if (idleSec >= 180) {
-    const remMin = Math.max(1, Math.ceil((240 - idleSec) / 60));
-    cacheIconSvg =
-      '<svg width="10" height="10" viewBox="0 0 12 12" fill="none" stroke="#d4940a" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="6" r="4.8"/><polyline points="6 3.5 6 6 7.8 7.2"/></svg>';
-    cacheValColor = '#d4940a';
-    valCacheHitK = '~' + remMin + 'm';
-    ctxIconColor = 'rgba(206, 168, 92, 0.88)';
-  }
-
-  const quotaSummaryGroups = [];
-  let quotaHtml = '';
-  const windowOrder = { '5h': 0, weekly: 1 };
-  for (const g of d.quotaGroups || []) {
-    const rawName = String(g.displayName || '').trim().toLowerCase();
-    const title = formatGroupTitle(g.displayName);
-    const descMatch = String(g.description || '').match(/models within this group:\s*([^\n.]+)/i);
-    const modelsInGroup = descMatch ? descMatch[1].toLowerCase() : '';
-    let q5h = '--%';
-    let qWk = '--%';
-
-    quotaHtml += '<div class="dk-q-group">';
-    quotaHtml += '<div class="dk-q-title">' + title + '</div>';
-    const buckets = [...(g.buckets || [])].sort(
-      (a, b) => (windowOrder[a.window] ?? 2) - (windowOrder[b.window] ?? 2)
-    );
-    for (const b of buckets) {
-      const baseLabel =
-        b.window === 'weekly'
-          ? 'Weekly'
-          : b.window === '5h'
-            ? '5 Hours'
-            : String(b.displayName || b.window || '')
-                .replace(/\s*limit\b/gi, '')
-                .replace(/\b5h(?:ours)?\b/gi, '5 Hours')
-                .trim();
-      const resetShort = formatResetShort(b.resetTime);
-      const pctLeft = Math.round((b.remainingFraction || 0) * 100);
-      const pctStr = pctLeft + '%';
-
-      if (b.window === '5h') q5h = pctStr;
-      if (b.window === 'weekly') qWk = pctStr;
-
-      quotaHtml += '<div class="dk-q-row">';
-      quotaHtml += '  <span class="dk-q-label">' + baseLabel + '</span>';
-      quotaHtml += '  <span class="dk-q-right"><span>' + pctLeft + '%</span>' + makeRingSvg(b.remainingFraction) + '</span>';
-      quotaHtml += '  <span class="dk-q-mid">' + resetShort + '</span>';
+  const quotaGroups = quotaView(d.quotaGroups, d.prefs);
+  const quotaSummaryGroups = quotaGroups.map(({ title, rawName, modelsInGroup, q5h, qWk }) => ({ title, rawName, modelsInGroup, q5h, qWk }));
+  const useBar = appearance(d.prefs).quotaIndicator === 'bar';
+  let quotaHtml = '<div class="dk-panel-content">';
+  for (const g of quotaGroups) {
+    quotaHtml += '<div class="dk-q-group" data-pool="' + escapeHtml(g.rawName) + '">';
+    quotaHtml += '<div class="dk-q-title">' + escapeHtml(g.title) + '<span class="dk-q-active" style="color:' + g.activeColor + '" aria-hidden="true"></span></div>';
+    for (const b of g.buckets) {
+      quotaHtml += '<div class="dk-q-row" data-quota-tooltip="' + escapeHtml(JSON.stringify(b.tooltip)) + '">';
+      const indicator = useBar
+        ? '<span class="dk-q-meter"><span style="width:' + b.barWidth + '%;background:' + b.color + '"></span></span>'
+        : makeRingSvg(b.remainingFraction);
+      quotaHtml += '  <span class="dk-q-label"' + (b.labelKey ? ' data-i18n="' + b.labelKey + '"' : '') + '>' + escapeHtml(b.label) + '</span>';
+      quotaHtml += '  <span class="dk-q-right"><span class="dk-q-pct notranslate" translate="no">' + b.pctLeft + '%</span>' + indicator + '</span>';
+      quotaHtml += '  <span class="dk-q-mid notranslate" translate="no">' + escapeHtml(b.resetShort) + '</span>';
       quotaHtml += '</div>';
     }
     quotaHtml += '</div>';
-    quotaSummaryGroups.push({ title, rawName, modelsInGroup, q5h, qWk });
   }
 
+  quotaHtml += '</div>';
   return {
-    pillCtx: hasMax ? usedPctRound + '%' : (ctx === 0 ? '0%' : '--%'),
+    prefs: d.prefs || { language: 'en' },
+    generation: d.generation || null,
+    turnSpeed: d.turnSpeed || null,
+    turnQueue: d.turnQueue || null,
+    turnMetrics: d.turnMetrics || null,
+    requestError: d.requestError || { kind: 'none' },
+    cloudPaygo: d.cloudPaygo === true,
+    cache: { contextTokens: ctx.ctx, cachedIn: ctx.cached, lastStepEpochMs: d.lastStepEpochMs || 0 },
+    contextData: { contextTokens: ctx.ctx, maxContextTokens: ctx.maxCtx, cachedIn: ctx.cached, uncachedIn: d.uncachedIn, turn0Tokens: ctx.turn0, totalOutputTokens: ctx.out, totalThinkingTokens: ctx.think },
+    pillCtx: ctx.usedPct,
     ctxIconColor,
-    usedPctText: hasMax ? usedPctRound + '% used' : (ctx === 0 ? '0% used' : '--% used'),
-    usedFrac: fmtK(ctx) + ' / ' + (hasMax ? fmtK(maxCtx) : '--'),
-    segReadW,
-    segOutW,
-    segThinkW,
-    segTurn0W,
+    usedPctText: ctx.usedPct + ' used',
+    usedFrac: ctx.usedFrac,
+    segReadW: ctx.segReadW,
+    segOutW: ctx.segOutW,
+    segThinkW: ctx.segThinkW,
+    segTurn0W: ctx.segTurn0W,
+    cacheIndicator,
+    cacheProgressPct,
+    cacheProgressColor,
     cacheIconSvg,
     cacheValColor,
     cacheValDeco,
     cacheValOp,
     valCacheHit,
     valCacheHitK,
-    valTurn0Pct: turn0Pct,
-    valTurn0K: fmtColK(turn0),
-    valReadPct: readPct,
-    valReadK: fmtColK(read),
-    valThinkPct: thinkPct,
-    valThinkK: fmtColK(think),
-    valOutPct: outPct,
-    valOutK: fmtColK(out),
-    valRead: readPct + ' · ' + fmtK(read),
-    valOut: outPct + ' · ' + fmtK(out),
-    valThink: thinkPct + ' · ' + fmtK(think),
-    valTurn0: turn0Pct + ' · ' + fmtK(turn0),
+    valTurn0Pct: ctx.turn0Pct,
+    valTurn0K: ctx.turn0K,
+    valReadPct: ctx.readPct,
+    valReadK: ctx.readK,
+    valThinkPct: ctx.thinkPct,
+    valThinkK: ctx.thinkK,
+    valOutPct: ctx.outPct,
+    valOutK: ctx.outK,
+    valRead: ctx.readPct + ' · ' + ctx.readK,
+    valOut: ctx.outPct + ' · ' + ctx.outK,
+    valThink: ctx.thinkPct + ' · ' + ctx.thinkK,
+    valTurn0: ctx.turn0Pct + ' · ' + ctx.turn0K,
     quotaSummaryGroups,
     quotaHtml,
     instanceTs: INSTANCE_TS,
   };
 }
 
-async function tick(inspect) {
-  const port = readCdpPort();
-  if (!port) return logOnce('DevToolsActivePort not found');
-  let targets;
-  try {
-    targets = await (await fetch(`http://127.0.0.1:${port}/json/list`)).json();
-  } catch (e) {
-    return logOnce('CDP list failed: ' + e.message);
-  }
-  const pages = targets.filter(
-    (t) => t.type === 'page' && /^https?:\/\/127\.0\.0\.1/.test(t.url || '') && t.webSocketDebuggerUrl
-  );
-  for (const t of pages) {
-    try {
-      const entry = sockets.get(t.id) || (await connect(t));
-      const path = (await evaluate(entry, 'location.pathname')) || '';
-      const m = path.match(/\/c\/([0-9a-f-]{36})/);
-      const data = await inspect(m ? m[1] : '', true);
-      if (data?.error) continue;
-      const res = await evaluate(entry, `(${pageMount.toString()})(${JSON.stringify(toView(data))})`);
-      if (res === 'superseded') {
-        process.exit(0);
-      }
-      if (res && res.startsWith('ok')) lastErr = '';
-    } catch (e) {
-      sockets.delete(t.id);
-      logOnce('page ' + t.id + ': ' + e.message);
+// Installed once in each renderer. Clocks/layout keep updating without a CDP
+// payload, and navigation clears old data before the next server snapshot.
+function installRuntime(owner, hash) {
+  const previous = globalThis.__agyCapsuleDeck;
+  if (previous?.owner > owner) return 'superseded';
+  previous?.dispose();
+  window.__deckOwnerTs = owner;
+  let data = null;
+  let dataPath = '';
+  let disposed = false;
+  const run = () => {
+    if (disposed || !data) return;
+    if (globalThis.__agyCapsuleDeck !== api) return;
+    if (location.pathname !== dataPath) {
+      window.__agyCapsuleCleanup?.();
+      return;
     }
-  }
+    // Installed runtimes own the page; one-off legacy mounts must not strand
+    // this runtime behind a newer timestamp while leaving two visible strips.
+    window.__deckOwnerTs = owner;
+    pageMount(toView(data));
+  };
+  const timer = setInterval(run, 1000);
+  const api = {
+    owner, hash,
+    readState(caller) {
+      if (caller < owner) return 'superseded';
+      return { owner, hash, path: location.pathname, hasFooter: !!findFooterLeft() };
+    },
+    apply(next, path, caller) {
+      if (caller < owner) return 'superseded';
+      if (caller !== owner || disposed || path !== location.pathname) return false;
+      data = next;
+      dataPath = path;
+      run();
+      return true;
+    },
+    dispose() {
+      if (disposed) return;
+      disposed = true;
+      clearInterval(timer);
+      if (globalThis.__agyCapsuleDeck === api) {
+        window.__agyCapsuleCleanup?.();
+        delete globalThis.__agyCapsuleDeck;
+      }
+    },
+  };
+  globalThis.__agyCapsuleDeck = api;
+  return true;
+}
+
+export function buildRuntimeBundle(owner = INSTANCE_TS) {
+  const functions = [toView, findFooterLeft, pageMount, installRuntime].map(fn => fn.toString()).join('\n');
+  const source = getPresentationScript() + '\n' + functions;
+  const hash = createHash('sha256').update(source).digest('hex').slice(0, 16);
+  const code = `(()=>{const INSTANCE_TS=${Number(owner)};if(globalThis.__agyCapsuleDeck?.owner>INSTANCE_TS)return 'superseded';${getPresentationScript()}\nconst {escapeHtml,appearance,cacheView,contextBreakdown,quotaView,makeRingSvg}=globalThis.__agyCapsulePresentation;\n${functions}\nreturn installRuntime(INSTANCE_TS,${JSON.stringify(hash)});})()`;
+  return { code, hash };
 }
 
 export { pageMount, toView };
 
-export function startDeckInjector(inspect) {
+export function startDeckInjector(inspect, options = {}) {
+  const owner = options.instanceTs ?? INSTANCE_TS;
+  const bundle = buildRuntimeBundle(owner);
+  const sockets = new Map();
+  let cachedPages = [];
+  let lastListAt = 0;
+  let lastErr = '';
+  let stopped = false;
   let busy = false;
-  setInterval(async () => {
-    if (busy) return;
+  // 'unknown' until the first lookup; the sidebar explains 'missing' / 'unreachable'.
+  let cdpState = 'unknown';
+  const logOnce = message => {
+    if (lastErr !== message) { lastErr = message; console.error('[deck]', message); }
+  };
+  const retire = (entry, id) => {
+    if (entry.closed) return;
+    entry.closed = true;
+    for (const callback of entry.pending.values()) callback(undefined);
+    entry.pending.clear();
+    try { entry.ws.close(); } catch {}
+    if (sockets.get(id) === entry) sockets.delete(id);
+  };
+  const connect = async target => {
+    const ws = new WebSocket(target.webSocketDebuggerUrl);
+    const entry = { ws, pending: new Map(), nextId: 1, lastPayload: '', lastPath: '' };
+    await new Promise((resolve, reject) => {
+      const fail = message => { clearTimeout(timer); retire(entry, target.id); reject(new Error(message)); };
+      const timer = setTimeout(() => fail('ws timeout'), 3000);
+      ws.onopen = () => { clearTimeout(timer); resolve(); };
+      ws.onerror = () => fail('ws error');
+    });
+    if (stopped) { retire(entry, target.id); throw new Error('injector stopped'); }
+    ws.onmessage = event => {
+      try {
+        const message = JSON.parse(event.data);
+        const callback = entry.pending.get(message.id);
+        if (callback) { entry.pending.delete(message.id); callback(message); }
+      } catch {}
+    };
+    ws.onclose = () => retire(entry, target.id);
+    sockets.set(target.id, entry);
+    return entry;
+  };
+  const evaluate = (entry, expression) => new Promise(resolve => {
+    if (entry.ws.readyState !== 1) return resolve(undefined);
+    const id = entry.nextId++;
+    const timer = setTimeout(() => { entry.pending.delete(id); resolve(undefined); }, 3000);
+    entry.pending.set(id, message => { clearTimeout(timer); resolve(message?.result?.result?.value); });
+    try { entry.ws.send(JSON.stringify({ id, method: 'Runtime.evaluate', params: { expression, returnByValue: true } })); }
+    catch { clearTimeout(timer); entry.pending.delete(id); resolve(undefined); }
+  });
+  const pages = async () => {
+    if (cachedPages.length && Date.now() - lastListAt < 4000) return cachedPages;
+    let port;
+    try { port = readFileSync(options.portFile || PORT_FILE, 'utf8').split(/\r?\n/)[0].trim(); }
+    catch { cdpState = 'missing'; logOnce('DevToolsActivePort not found'); return []; }
+    try {
+      const response = await fetch(`http://127.0.0.1:${port}/json/list`, { signal: AbortSignal.timeout(3000) });
+      if (!response.ok) throw new Error('HTTP ' + response.status);
+      const targets = await response.json();
+      cachedPages = targets.filter(t => t.type === 'page' && /^https?:\/\/127\.0\.0\.1:\d+\//.test(t.url || '') && t.webSocketDebuggerUrl);
+      lastListAt = Date.now();
+      cdpState = 'ok';
+      const ids = new Set(cachedPages.map(t => t.id));
+      for (const [id, entry] of sockets) if (!ids.has(id)) retire(entry, id);
+      return cachedPages;
+    } catch (error) { cdpState = 'unreachable'; logOnce('CDP list failed: ' + error.message); return []; }
+  };
+  const stop = async () => {
+    if (stopped) return;
+    stopped = true;
+    clearInterval(timer);
+    await Promise.all([...sockets].map(async ([id, entry]) => {
+      try { await evaluate(entry, `globalThis.__agyCapsuleDeck?.owner===${owner}&&globalThis.__agyCapsuleDeck.dispose()`); }
+      finally { retire(entry, id); }
+    }));
+  };
+  const supersede = async () => {
+    await stop();
+    (options.onSuperseded || (() => process.exit(0)))();
+  };
+  const tick = async () => {
+    if (busy || stopped) return;
     busy = true;
     try {
-      await tick(inspect);
-    } finally {
-      busy = false;
-    }
-  }, INTERVAL_MS);
-  console.log('[deck] injector started, port file:', PORT_FILE);
+      const list = await pages();
+      options.onStatus?.(cdpState);
+      for (const target of list) {
+        if (stopped) break;
+        try {
+          const entry = sockets.get(target.id) || await connect(target);
+          let state = await evaluate(entry, `globalThis.__agyCapsuleDeck?.readState(${owner})??null`);
+          if (state === undefined || stopped) continue;
+          if (state === 'superseded') return await supersede();
+          if (state?.owner !== owner || state.hash !== bundle.hash) {
+            const installed = await evaluate(entry, bundle.code);
+            if (installed === 'superseded') return await supersede();
+            if (!installed || stopped) continue;
+            entry.lastPayload = '';
+            state = await evaluate(entry, `globalThis.__agyCapsuleDeck?.readState(${owner})??null`);
+          }
+          if (state === 'superseded') return await supersede();
+          if (state?.owner !== owner || !state.path || state.hasFooter === false) continue;
+          const match = state.path.match(/\/c\/([0-9a-f-]{36})/);
+          const data = await inspect(match ? match[1] : '', true);
+          if (!data || data.error || stopped) continue;
+          const payload = JSON.stringify(data);
+          if (entry.lastPayload !== payload || entry.lastPath !== state.path) {
+            const applied = await evaluate(entry, `globalThis.__agyCapsuleDeck?.apply(${payload},${JSON.stringify(state.path)},${owner})??false`);
+            if (applied === 'superseded') return await supersede();
+            if (applied) { entry.lastPayload = payload; entry.lastPath = state.path; }
+            else entry.lastPayload = '';
+          }
+          lastErr = '';
+        } catch (error) {
+          const entry = sockets.get(target.id);
+          if (entry) retire(entry, target.id);
+          logOnce('page ' + target.id + ': ' + error.message);
+        }
+      }
+    } finally { busy = false; }
+  };
+  const timer = setInterval(tick, INTERVAL_MS);
+  console.log('[deck] injector started, port file:', options.portFile || PORT_FILE);
+  return { tick, stop, status: () => cdpState };
 }

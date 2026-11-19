@@ -3,6 +3,7 @@ import { readdirSync, statSync, existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, basename } from 'node:path';
 import { startDeckInjector } from './deck_injector.mjs';
+import { createCdpSetupManager } from './cdp_setup.mjs';
 
 const CONV_DIR = join(homedir(), '.gemini', 'antigravity', 'conversations');
 const convCache = new Map(); // convId -> { sig, result }
@@ -223,5 +224,8 @@ function inspectConversation(convId, exact = false) {
 export { inspectConversation };
 
 if (process.env.ANTIGRAVITY_LS_ADDRESS || process.env.ANTIGRAVITY_SIDECAR_WEB_PORT) {
-  startDeckInjector(inspectConversation);
+  const cdpSetup = createCdpSetupManager();
+  startDeckInjector(inspectConversation, {
+    onState: (cdpState) => cdpSetup.observe(cdpState),
+  });
 }
